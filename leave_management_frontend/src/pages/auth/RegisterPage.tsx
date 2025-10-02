@@ -160,6 +160,7 @@ const RegisterPage = () => {
               >
                 <option value="Backend">Backend</option>
                 <option value="Frontend">Frontend</option>
+                <option value="Frontend">Support</option>
                 <option value="Design">Design</option>
                 <option value="HR">HR</option>
               </select>
@@ -173,7 +174,7 @@ const RegisterPage = () => {
                 type="text"
                 value={formData.position}
                 onChange={(e) => setFormData({ ...formData, position: e.target.value })}
-                placeholder="e.g., Senior Developer"
+                placeholder="e.g., Support Engineer"
                 className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
