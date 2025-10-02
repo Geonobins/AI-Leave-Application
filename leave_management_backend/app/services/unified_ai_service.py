@@ -158,73 +158,128 @@ Respond ONLY with valid JSON:
             
             if response.status_code == 200:
                 result = response.json()
-                parsed = json.loads(result["choices"][0]["message"]["content"])
                 
-                # Convert date strings to date objects
+                # FIX: Handle cases where API returns string instead of JSON
+                content = result["choices"][0]["message"]["content"]
+                
+                # Try to parse as JSON, fallback if it's a string or invalid JSON
+                try:
+                    if isinstance(content, str):
+                        parsed = json.loads(content)
+                    else:
+                        parsed = content
+                        
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"JSON parsing failed, using fallback parser: {e}")
+                    print(f"Raw content: {content}")
+                    return self._fallback_parse(text, user_context)
+                
+                # Ensure parsed is a dictionary
+                if not isinstance(parsed, dict):
+                    print(f"Parsed content is not a dictionary: {type(parsed)}")
+                    return self._fallback_parse(text, user_context)
+                
+                # Convert date strings to date objects with error handling
                 if parsed.get("start_date"):
                     try:
-                        parsed["start_date"] = datetime.strptime(
-                            parsed["start_date"], "%Y-%m-%d"
-                        ).date()
-                    except:
-                        pass
+                        if isinstance(parsed["start_date"], str):
+                            parsed["start_date"] = datetime.strptime(
+                                parsed["start_date"], "%Y-%m-%d"
+                            ).date()
+                    except (ValueError, TypeError) as e:
+                        print(f"Error parsing start_date: {e}")
+                        parsed["start_date"] = None
                 
                 if parsed.get("end_date"):
                     try:
-                        parsed["end_date"] = datetime.strptime(
-                            parsed["end_date"], "%Y-%m-%d"
-                        ).date()
-                    except:
-                        pass
-                
-                # Handle date_filter dates
-                if parsed.get("date_filter"):
-                    if parsed["date_filter"].get("start_date"):
-                        try:
-                            parsed["date_filter"]["start_date"] = datetime.strptime(
-                                parsed["date_filter"]["start_date"], "%Y-%m-%d"
+                        if isinstance(parsed["end_date"], str):
+                            parsed["end_date"] = datetime.strptime(
+                                parsed["end_date"], "%Y-%m-%d"
                             ).date()
-                        except:
-                            pass
+                    except (ValueError, TypeError) as e:
+                        print(f"Error parsing end_date: {e}")
+                        parsed["end_date"] = None
+                
+                # Handle date_filter dates with error handling
+                if parsed.get("date_filter") and isinstance(parsed["date_filter"], dict):
+                    date_filter = parsed["date_filter"]
                     
-                    if parsed["date_filter"].get("end_date"):
+                    if date_filter.get("start_date") and isinstance(date_filter["start_date"], str):
                         try:
-                            parsed["date_filter"]["end_date"] = datetime.strptime(
-                                parsed["date_filter"]["end_date"], "%Y-%m-%d"
+                            date_filter["start_date"] = datetime.strptime(
+                                date_filter["start_date"], "%Y-%m-%d"
                             ).date()
-                        except:
-                            pass
+                        except (ValueError, TypeError) as e:
+                            print(f"Error parsing date_filter start_date: {e}")
+                            date_filter["start_date"] = None
+                    
+                    if date_filter.get("end_date") and isinstance(date_filter["end_date"], str):
+                        try:
+                            date_filter["end_date"] = datetime.strptime(
+                                date_filter["end_date"], "%Y-%m-%d"
+                            ).date()
+                        except (ValueError, TypeError) as e:
+                            print(f"Error parsing date_filter end_date: {e}")
+                            date_filter["end_date"] = None
                 
-                # Convert leave_type string to enum
+                # Convert leave_type string to enum with error handling
                 if parsed.get("leave_type"):
                     try:
-                        parsed["leave_type"] = LeaveType[parsed["leave_type"]]
-                    except KeyError:
+                        if isinstance(parsed["leave_type"], str):
+                            parsed["leave_type"] = LeaveType[parsed["leave_type"].upper()]
+                    except (KeyError, AttributeError) as e:
+                        print(f"Error converting leave_type: {e}")
                         parsed["leave_type"] = None
                 
                 # Auto-populate employee_name for employees querying their own data
-                if parsed["intent"] in ["QUERY_LEAVES", "CHECK_BALANCE"] and not parsed.get("employee_name"):
+                current_intent = parsed.get("intent")
+                if current_intent in ["QUERY_LEAVES", "CHECK_BALANCE"] and not parsed.get("employee_name"):
                     if not user_context["is_manager"] or parsed.get("status") == "PENDING":
                         parsed["employee_name"] = user_context["full_name"]
                 
                 # Validate completeness for leave requests
-                if parsed["intent"] == "REQUEST_LEAVE":
+                if current_intent == "REQUEST_LEAVE":
                     parsed = self._check_leave_completeness(parsed)
                 
                 # Add role-appropriate suggested actions
                 if not parsed.get("suggested_actions"):
-                    parsed["suggested_actions"] = self._get_role_suggested_actions(user_context, parsed["intent"])
+                    parsed["suggested_actions"] = self._get_role_suggested_actions(
+                        user_context, 
+                        current_intent or "GENERAL"
+                    )
                 
+                # Ensure intent is always set and valid
+                if not parsed.get("intent"):
+                    parsed["intent"] = "GENERAL"
+                
+                # Validate intent is one of the expected values
+                valid_intents = ["REQUEST_LEAVE", "APPROVE_REJECT", "QUERY_LEAVES", 
+                               "CHECK_BALANCE", "TEAM_STATUS", "ANALYTICS", "GENERAL"]
+                if parsed["intent"] not in valid_intents:
+                    print(f"Invalid intent detected: {parsed['intent']}, defaulting to GENERAL")
+                    parsed["intent"] = "GENERAL"
+                    
                 return parsed
             
             else:
                 print(f"Groq API Error: {response.status_code} - {response.text}")
+                return self._fallback_parse(text, user_context)
                 
+        except requests.exceptions.Timeout:
+            print("Groq API timeout, using fallback parser")
+            return self._fallback_parse(text, user_context)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Groq API request failed: {e}")
+            return self._fallback_parse(text, user_context)
+            
+        except KeyError as e:
+            print(f"Key error in API response: {e}")
+            return self._fallback_parse(text, user_context)
+            
         except Exception as e:
-            print(f"Error calling Groq API: {e}")
-        
-        # Fallback parser with role awareness
-        return self._fallback_parse(text, user_context)
+            print(f"Unexpected error in parse_conversation: {e}")
+            return self._fallback_parse(text, user_context)
 
     def _get_role_suggested_actions(self, user_context: Dict, intent: str) -> List[str]:
         """Get role-appropriate suggested actions"""
@@ -289,9 +344,10 @@ Respond ONLY with valid JSON:
         return parsed
     
     def _fallback_parse(self, text: str, user_context: Dict) -> Dict:
-        """Simple rule-based fallback parser"""
-        text_lower = text.lower()
+        """Enhanced rule-based fallback parser with better intent detection"""
+        text_lower = text.lower().strip()
         
+        # Default result structure
         result = {
             "intent": "GENERAL",
             "leave_type": None,
@@ -302,22 +358,69 @@ Respond ONLY with valid JSON:
             "needs_clarification": False,
             "missing_fields": [],
             "status": None,
-            "date_filter": None
+            "date_filter": None,
+            "employee_name": user_context["full_name"] if not user_context["is_manager"] else None,
+            "action": None,
+            "suggested_actions": self._get_role_suggested_actions(user_context, "GENERAL")
         }
         
-        # Detect intent for pending approvals
-        if any(word in text_lower for word in ["pending", "approval", "approve", "need approval"]):
+        # Intent: "Who is on leave today?"
+        if any(phrase in text_lower for phrase in ["who is on leave", "who's on leave", "who is absent", "anyone on leave"]):
             result["intent"] = "QUERY_LEAVES"
-            result["status"] = LeaveStatus.PENDING
-        
-        # Detect intent for general leave queries
-        elif any(word in text_lower for word in ["who's on leave", "show leaves", "leave list", "who is absent", "leaves"]):
-            result["intent"] = "QUERY_LEAVES"
+            result["date_filter"] = {"type": "TODAY"}
+            result["status"] = "APPROVED"  # Only show approved leaves
             
             if "today" in text_lower:
                 result["date_filter"] = {"type": "TODAY"}
             elif "this week" in text_lower:
                 result["date_filter"] = {"type": "THIS_WEEK"}
+            elif "tomorrow" in text_lower:
+                tomorrow = datetime.now().date() + timedelta(days=1)
+                result["date_filter"] = {"type": "SPECIFIC_DATE", "date": tomorrow.isoformat()}
+        
+        # Intent: Pending approvals
+        elif any(word in text_lower for word in ["pending", "approval", "approve", "need approval", "awaiting"]):
+            if user_context["is_manager"]:
+                result["intent"] = "APPROVE_REJECT"
+                result["action"] = "CHECK_PENDING"
+                result["suggested_actions"] = ["View pending approvals", "Approve leaves", "Check team status"]
+            else:
+                result["intent"] = "QUERY_LEAVES"
+                result["status"] = "PENDING"
+                result["employee_name"] = user_context["full_name"]
+                result["suggested_actions"] = ["Check my leaves", "View balance", "Request leave"]
+        
+        # Intent: Leave requests
+        elif any(word in text_lower for word in ["request leave", "apply for leave", "take leave", "need leave"]):
+            result["intent"] = "REQUEST_LEAVE"
+            result["needs_clarification"] = True
+            result["suggested_actions"] = ["Check balance", "View my leaves"]
+            
+            # Try to extract leave type
+            if "sick" in text_lower:
+                result["leave_type"] = LeaveType.SICK
+            elif "casual" in text_lower:
+                result["leave_type"] = LeaveType.CASUAL
+            elif "annual" in text_lower or "vacation" in text_lower:
+                result["leave_type"] = LeaveType.ANNUAL
+        
+        # Intent: Balance check
+        elif any(word in text_lower for word in ["balance", "available days", "leave days", "how many days"]):
+            result["intent"] = "CHECK_BALANCE"
+            result["suggested_actions"] = ["Request leave", "View my leaves"]
+        
+        # Intent: Team status (managers only)
+        elif any(word in text_lower for word in ["team status", "team availability", "my team"]) and user_context["is_manager"]:
+            result["intent"] = "TEAM_STATUS"
+            result["suggested_actions"] = ["Pending approvals", "View analytics", "Check balances"]
+        
+        # Intent: General leave queries
+        elif any(word in text_lower for word in ["show leaves", "leave list", "leaves", "leave history"]):
+            result["intent"] = "QUERY_LEAVES"
+            result["suggested_actions"] = ["Check balance", "Request leave"]
+            
+            if "my" in text_lower and not user_context["is_manager"]:
+                result["employee_name"] = user_context["full_name"]
         
         return result
     
@@ -380,14 +483,16 @@ Generate a helpful response for the user:"""
             )
             
             if response.status_code == 200:
-                ai_response = response.json()["choices"][0]["message"]["content"]
+                result = response.json()
+                ai_response = result["choices"][0]["message"]["content"]
                 return ai_response.strip()
+            else:
+                print(f"Groq API response error: {response.status_code}")
+                return self._generate_fallback_response(intent, parsed, data, user_context)
                 
         except Exception as e:
             print(f"Response generation failed: {e}")
-        
-        # Fallback responses
-        return self._generate_fallback_response(intent, parsed, data, user_context)
+            return self._generate_fallback_response(intent, parsed, data, user_context)
     
     def _generate_fallback_response(
         self,
@@ -421,7 +526,7 @@ Generate a helpful response for the user:"""
                     response += "Suggested colleagues to handle your responsibilities:\n"
                     for i, person in enumerate(suggested[:3], 1):
                         response += f"{i}. {person['name']} ({person['position']}) - {person['reason']}\n"
-                    response += "\nReply with a number to select, or 'submit' to finalize your leave request."
+                    response += "\nReply with a number to select, or 'submit' to proceed without assignment."
                 else:
                     response += "Type 'submit' to finalize your leave request."
                 
