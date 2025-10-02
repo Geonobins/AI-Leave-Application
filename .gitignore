@@ -32,3 +32,6 @@ Thumbs.db
 # Alembic
 leave_management_backend/alembic/versions/*.py
 !leave_management_backend/alembic/versions/__init__.py
+
+.env
+.env.local
