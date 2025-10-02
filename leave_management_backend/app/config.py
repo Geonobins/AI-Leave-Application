@@ -22,13 +22,13 @@ class Settings(BaseSettings):
     def get_database_url(self) -> str:
         """
         Returns the correct database URL.
-        Converts postgres:// to postgresql+psycopg2:// for SQLAlchemy compatibility
+        Converts postgres:// to postgresql:// for SQLAlchemy compatibility
         """
         db_url = self.DATABASE_URL
         
         # Render and some other platforms use postgres:// but SQLAlchemy needs postgresql://
         if db_url.startswith("postgres://"):
-            db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
         
         return db_url
 
