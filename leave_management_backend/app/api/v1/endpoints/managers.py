@@ -1,16 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_, or_
-from typing import List, Optional
-from datetime import datetime, date, timedelta
-from collections import defaultdict, Counter
+from typing import List
+from datetime import datetime
 from app.database import get_db
 from app.models.user import User, UserRole
-from app.models.leave import Leave, LeaveStatus, LeaveType
-from app.models.leave_balance import LeaveBalance
-from app.schemas.leave import LeaveResponse, LeaveApproval
+from app.models.leave import Leave, LeaveStatus
 from app.api.deps import get_current_manager
 from app.services.ai_service import AIService
+from app.services.policy_rag_service import PolicyRAGService
+from app.config import settings
+from app.schemas.leave import LeaveResponse, LeaveApproval
+
 
 router = APIRouter()
 
@@ -19,33 +19,107 @@ def get_pending_leaves(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_manager)
 ):
-    """Get all pending leave requests for team members"""
+    """Get all pending leave requests for team members with policy compliance check"""
+    
+    # Get team members
     team_members = db.query(User).filter(User.manager_id == current_user.id).all()
     team_ids = [m.id for m in team_members]
     
+    # Get pending leaves
     pending_leaves = db.query(Leave).filter(
         Leave.employee_id.in_(team_ids),
         Leave.status == LeaveStatus.PENDING
-    ).all()
+    ).order_by(Leave.created_at.desc()).all()
     
     ai_service = AIService()
+    rag_service = PolicyRAGService(db, settings.GROQ_API_KEY)
+    
     results = []
     
     for leave in pending_leaves:
         employee = db.query(User).filter(User.id == leave.employee_id).first()
         
+        # Calculate team impact
         team_data = []
         impact = ai_service.calculate_impact_score({
             "start_date": leave.start_date,
             "end_date": leave.end_date
         }, team_data)
         
-        results.append({
-            "leave": LeaveResponse.from_orm(leave),
+        # CHECK POLICY COMPLIANCE
+        policy_compliance = None
+        try:
+            user_context = {
+                "user_id": employee.id,
+                "role": employee.role.value,
+                "department": employee.department,
+                "position": employee.position
+            }
+            
+            leave_request_dict = {
+                "leave_type": leave.leave_type.value,
+                "start_date": leave.start_date,
+                "end_date": leave.end_date,
+                "reason": leave.reason,
+                "notice_days": (leave.start_date - leave.created_at.date()).days
+            }
+            
+            policy_compliance = rag_service.check_policy_compliance(
+                leave_request=leave_request_dict,
+                user_context=user_context
+            )
+            
+        except Exception as e:
+            print(f"Policy compliance check failed for leave {leave.id}: {e}")
+            # Continue without policy check if it fails
+            policy_compliance = {
+                "compliant": True,
+                "violations": [],
+                "warnings": [],
+                "relevant_policies": []
+            }
+        
+        # Build result with policy info
+        duration = (leave.end_date - leave.start_date).days + 1
+        
+        result = {
+            "leave_id": leave.id,
+            "employee_id": employee.id,
             "employee_name": employee.full_name,
             "employee_position": employee.position,
-            "impact_score": impact
-        })
+            "leave_type": leave.leave_type.value,
+            "start_date": leave.start_date.isoformat(),
+            "end_date": leave.end_date.isoformat(),
+            "duration": duration,
+            "reason": leave.reason,
+            "created_at": leave.created_at.isoformat(),
+            "responsible_person_id": leave.responsible_person_id,
+            "impact_score": impact,
+            
+            # POLICY COMPLIANCE INFO
+            "policy_compliance": {
+                "compliant": policy_compliance.get("compliant", True),
+                "has_violations": not policy_compliance.get("compliant", True),
+                "violations": policy_compliance.get("violations", []),
+                "warnings": policy_compliance.get("warnings", []),
+                "relevant_policies": [
+                    {
+                        "section_title": p.get("section_title"),
+                        "content": p.get("content", "")[:200] + "...",  # Truncate for display
+                        "policy_name": p.get("policy_name")
+                    }
+                    for p in policy_compliance.get("relevant_policies", [])[:2]  # Top 2 policies
+                ]
+            }
+        }
+        
+        results.append(result)
+    
+    # Sort: violations first, then by date
+    results.sort(key=lambda x: (
+        not x["policy_compliance"]["has_violations"],  # False (no violations) sorts after True
+        x["created_at"]
+    ))
     
     return results
 

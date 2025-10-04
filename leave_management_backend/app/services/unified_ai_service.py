@@ -44,11 +44,13 @@ For EMPLOYEES (non-managers):
 - "pending requests" means THEIR OWN pending leaves
 - "need approval" means THEIR OWN leaves awaiting manager approval
 - Cannot view team status or analytics
+- Can query policies (QUERY_POLICY)
 
 For MANAGERS/HR:
 - Can approve/reject leaves
 - "pending requests" means LEAVES AWAITING THEIR APPROVAL
 - Can view team status and department data
+- Can query policies (QUERY_POLICY)
 
 Determine the INTENT and extract relevant information:
 
@@ -59,7 +61,22 @@ INTENTS:
 4. CHECK_BALANCE - Check leave balances
 5. TEAM_STATUS - Check team availability (MANAGERS/HR ONLY)
 6. ANALYTICS - View analytics (HR ONLY)
-7. GENERAL - General question or greeting
+7. QUERY_POLICY - Ask about company policies (ALL USERS)
+8. GENERAL - General question or greeting
+
+NEW INTENT - QUERY_POLICY:
+- "what is the leave policy"
+- "summarize leave policy"
+- "tell me about sick leave policy"
+- "what are the rules for annual leave"
+- "how many days notice do I need"
+- "can I take leave in December"
+- "what's the policy on maternity leave"
+- Any question about policies, rules, guidelines, requirements
+
+FOR QUERY_POLICY, extract:
+- policy_query: the actual question about the policy
+- policy_type: LEAVE, SICK, ANNUAL, CASUAL, MATERNITY, PATERNITY, GENERAL
 
 SPECIAL ROLE-BASED CASES:
 
@@ -113,7 +130,9 @@ SUGGESTED ACTIONS:
 
 Respond ONLY with valid JSON:
 {{
-    "intent": "QUERY_LEAVES",
+    "intent": "QUERY_POLICY",
+    "policy_query": "what is the leave policy",
+    "policy_type": "LEAVE",
     "leave_type": null,
     "start_date": null,
     "end_date": null,
@@ -122,11 +141,11 @@ Respond ONLY with valid JSON:
     "needs_clarification": false,
     "action": null,
     "leave_id": null,
-    "employee_name": "{user_context['full_name']}",
+    "employee_name": null,
     "date_filter": null,
     "department": null,
-    "status": "PENDING",
-    "suggested_actions": ["Check my leaves", "View all pending"]
+    "status": null,
+    "suggested_actions": ["Request leave", "Check balance", "View my leaves"]
 }}"""
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -254,7 +273,7 @@ Respond ONLY with valid JSON:
                 
                 # Validate intent is one of the expected values
                 valid_intents = ["REQUEST_LEAVE", "APPROVE_REJECT", "QUERY_LEAVES", 
-                               "CHECK_BALANCE", "TEAM_STATUS", "ANALYTICS", "GENERAL"]
+                               "CHECK_BALANCE", "TEAM_STATUS", "ANALYTICS", "QUERY_POLICY", "GENERAL"]
                 if parsed["intent"] not in valid_intents:
                     print(f"Invalid intent detected: {parsed['intent']}, defaulting to GENERAL")
                     parsed["intent"] = "GENERAL"
@@ -292,6 +311,8 @@ Respond ONLY with valid JSON:
                 return ["Request leave", "View my leaves"]
             elif intent == "REQUEST_LEAVE":
                 return ["Check balance", "View my leaves"]
+            elif intent == "QUERY_POLICY":
+                return ["Request leave", "Check balance", "View my leaves"]
             else:
                 return ["Check my leaves", "Request leave", "View balance"]
         
@@ -301,6 +322,8 @@ Respond ONLY with valid JSON:
                 return ["View all pending", "Process approvals", "Team status"]
             elif intent == "QUERY_LEAVES":
                 return ["Department report", "View analytics", "Pending approvals"]
+            elif intent == "QUERY_POLICY":
+                return ["View analytics", "Pending approvals", "Team status"]
             else:
                 return ["Pending approvals", "Team status", "View analytics"]
         
@@ -310,6 +333,8 @@ Respond ONLY with valid JSON:
                 return ["View pending approvals", "Team status", "Approve all"]
             elif intent == "QUERY_LEAVES":
                 return ["Team leaves", "Pending approvals", "Balance report"]
+            elif intent == "QUERY_POLICY":
+                return ["Pending approvals", "Team status", "View my team"]
             else:
                 return ["Pending approvals", "Team status", "View my team"]
     
@@ -344,12 +369,14 @@ Respond ONLY with valid JSON:
         return parsed
     
     def _fallback_parse(self, text: str, user_context: Dict) -> Dict:
-        """Enhanced rule-based fallback parser with better intent detection"""
+        """Enhanced rule-based fallback parser with policy query support"""
         text_lower = text.lower().strip()
         
         # Default result structure
         result = {
             "intent": "GENERAL",
+            "policy_query": None,
+            "policy_type": None,
             "leave_type": None,
             "start_date": None,
             "end_date": None,
@@ -363,6 +390,33 @@ Respond ONLY with valid JSON:
             "action": None,
             "suggested_actions": self._get_role_suggested_actions(user_context, "GENERAL")
         }
+        
+        # NEW: Check for policy queries
+        policy_keywords = ["policy", "rule", "guideline", "requirement", "how many", 
+                          "allowed", "notice period", "blackout", "documentation"]
+        
+        if any(keyword in text_lower for keyword in policy_keywords):
+            # Check if it's specifically about policies, not leave requests
+            if not any(word in text_lower for word in ["request", "apply for", "take leave", "book"]):
+                result["intent"] = "QUERY_POLICY"
+                result["policy_query"] = text
+                
+                # Detect policy type
+                if "sick" in text_lower:
+                    result["policy_type"] = "SICK"
+                elif "annual" in text_lower or "vacation" in text_lower:
+                    result["policy_type"] = "ANNUAL"
+                elif "casual" in text_lower:
+                    result["policy_type"] = "CASUAL"
+                elif "maternity" in text_lower:
+                    result["policy_type"] = "MATERNITY"
+                elif "paternity" in text_lower:
+                    result["policy_type"] = "PATERNITY"
+                else:
+                    result["policy_type"] = "LEAVE"
+                
+                result["suggested_actions"] = ["Request leave", "Check balance", "View my leaves"]
+                return result
         
         # Intent: "Who is on leave today?"
         if any(phrase in text_lower for phrase in ["who is on leave", "who's on leave", "who is absent", "anyone on leave"]):
@@ -405,7 +459,7 @@ Respond ONLY with valid JSON:
                 result["leave_type"] = LeaveType.ANNUAL
         
         # Intent: Balance check
-        elif any(word in text_lower for word in ["balance", "available days", "leave days", "how many days"]):
+        elif any(word in text_lower for word in ["balance", "available days", "leave days"]):
             result["intent"] = "CHECK_BALANCE"
             result["suggested_actions"] = ["Request leave", "View my leaves"]
         
@@ -431,9 +485,14 @@ Respond ONLY with valid JSON:
         data: Dict,
         user_context: Dict
     ) -> str:
-        """Generate contextual response based on intent and data"""
+        """Generate contextual response with policy compliance awareness"""
         
-        system_prompt = f"""You are a helpful leave management assistant.
+        # Check if policy compliance data exists
+        policy_compliance = data.get("policy_compliance")
+        has_violations = policy_compliance and not policy_compliance.get("compliant")
+        has_warnings = policy_compliance and policy_compliance.get("warnings")
+        
+        system_prompt = f"""You are a helpful leave management assistant with policy enforcement capabilities.
 
 User: {user_context['full_name']} ({user_context['role']} - {user_context['position']})
 
@@ -441,18 +500,23 @@ Generate natural, conversational responses.
 
 INTENT: {intent}
 
+POLICY COMPLIANCE STATUS:
+- Has Violations: {has_violations}
+- Has Warnings: {has_warnings}
+
 TONE GUIDELINES:
 - Friendly and professional
 - Clear and actionable
+- When policy violations exist: Be firm but empathetic, explain the policy clearly
+- When warnings exist: Inform user but don't block the action
+- For QUERY_POLICY: Summarize policy information clearly, cite specific rules
 - Adapt to the situation:
-  * REQUEST_LEAVE: Be supportive, confirm details, guide next steps
-  * APPROVE_REJECT: Be clear about the action taken
-  * QUERY_LEAVES: Present data clearly with key insights
-  * CHECK_BALANCE: Show numbers clearly
-  * TEAM_STATUS: Give overview with important highlights
-  * ANALYTICS: Focus on insights and trends
+  * REQUEST_LEAVE: Check policy compliance first, guide user to comply
+  * APPROVE_REJECT: Enforce policy violations strictly
+  * QUERY_POLICY: Explain policies clearly and concisely
+  * Other intents: Standard helpful tone
 
-Keep responses 2-3 sentences for simple queries, longer for complex data."""
+Keep responses 2-3 sentences for simple queries, longer for complex data or policy explanations."""
 
         user_prompt = f"""
 PARSED DATA:
@@ -461,7 +525,11 @@ PARSED DATA:
 RESULT DATA:
 {json.dumps(data, indent=2, default=str)}
 
-Generate a helpful response for the user:"""
+Generate a helpful response that:
+1. Addresses the user's request
+2. Clearly explains any policy violations or warnings
+3. Guides user on next steps
+4. Maintains professional but friendly tone"""
 
         try:
             response = requests.post(
@@ -477,7 +545,7 @@ Generate a helpful response for the user:"""
                         {"role": "user", "content": user_prompt}
                     ],
                     "temperature": 0.7,
-                    "max_tokens": 200
+                    "max_tokens": 300
                 },
                 timeout=8
             )
@@ -488,11 +556,58 @@ Generate a helpful response for the user:"""
                 return ai_response.strip()
             else:
                 print(f"Groq API response error: {response.status_code}")
-                return self._generate_fallback_response(intent, parsed, data, user_context)
+                return self._generate_fallback_response_with_policy(
+                    intent, parsed, data, user_context, policy_compliance
+                )
                 
         except Exception as e:
             print(f"Response generation failed: {e}")
-            return self._generate_fallback_response(intent, parsed, data, user_context)
+            return self._generate_fallback_response_with_policy(
+                intent, parsed, data, user_context, policy_compliance
+            )
+
+    def _generate_fallback_response_with_policy(
+        self,
+        intent: str,
+        parsed: Dict,
+        data: Dict,
+        user_context: Dict,
+        policy_compliance: Dict = None
+    ) -> str:
+        """Enhanced fallback with policy awareness"""
+        
+        # Check policy compliance
+        if policy_compliance:
+            violations = policy_compliance.get("violations", [])
+            warnings = policy_compliance.get("warnings", [])
+            
+            if violations and intent in ["REQUEST_LEAVE", "APPROVE_REJECT"]:
+                response = "Policy Violation Detected\n\n"
+                response += "Your request cannot be processed due to the following policy violations:\n\n"
+                for i, violation in enumerate(violations, 1):
+                    response += f"{i}. {violation}\n"
+                
+                # Show relevant policies
+                relevant = policy_compliance.get("relevant_policies", [])
+                if relevant:
+                    response += "\nRelevant Policy:\n"
+                    response += f"- {relevant[0]['section_title']}\n"
+                    response += f"  {relevant[0]['content'][:200]}...\n"
+                
+                response += "\nPlease revise your request to comply with company policy."
+                return response
+            
+            if warnings:
+                warning_text = "\n\nNote: " + "; ".join(warnings)
+            else:
+                warning_text = ""
+        else:
+            warning_text = ""
+        
+        # Use existing fallback logic
+        base_response = self._generate_fallback_response(intent, parsed, data, user_context)
+        
+        return base_response + warning_text
     
     def _generate_fallback_response(
         self,
@@ -512,7 +627,7 @@ Generate a helpful response for the user:"""
                 duration = (leave_data.get("end_date") - leave_data.get("start_date")).days + 1 if leave_data.get("end_date") and leave_data.get("start_date") else 1
                 leave_type = leave_data.get("leave_type")
                 
-                response = f"Got it! Your {leave_type.value.lower() if leave_type else 'leave'} request for {duration} day(s) "
+                response = f"Your {leave_type.value.lower() if leave_type else 'leave'} request for {duration} day(s) "
                 response += f"from {leave_data.get('start_date')} to {leave_data.get('end_date')}.\n\n"
                 
                 # Add balance info
@@ -600,7 +715,7 @@ Generate a helpful response for the user:"""
                 for member in on_leave_list[:5]:
                     response += f"- {member['employee_name']} ({member['position']}) - {member.get('leave_type', 'N/A')}\n"
             else:
-                response += "Everyone is available!"
+                response += "Everyone is available."
             
             return response
         
@@ -617,8 +732,27 @@ Generate a helpful response for the user:"""
             
             return response + "Check the detailed data below."
         
+        elif intent == "QUERY_POLICY":
+            policies = data.get("policies", [])
+            
+            if not policies:
+                return data.get("message", "I couldn't find specific policy information. Please contact HR.")
+            
+            response = f"Here's what I found about your question:\n\n"
+            
+            for i, policy in enumerate(policies[:2], 1):  # Show top 2
+                response += f"Policy: {policy['section_title']}\n"
+                response += f"{policy['content'][:300]}...\n"
+                response += f"(From: {policy['policy_name']} - {policy['relevance']} relevant)\n\n"
+            
+            if len(policies) > 2:
+                response += f"... and {len(policies) - 2} more relevant sections found.\n\n"
+            
+            response += "Would you like to know more about any specific aspect?"
+            return response
+        
         else:
-            return "How can I help you with leave management today? You can request leave, check balances, view team status, or ask me anything related to leaves."
+            return "How can I help you with leave management today? You can request leave, check balances, view team status, ask about policies, or ask me anything related to leaves."
     
     def calculate_impact_score(self, leave_data: Dict, team_data: List) -> Dict:
         """Calculate team impact score for a leave request"""

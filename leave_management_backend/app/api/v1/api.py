@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, employees, managers, hr, ai,unified_conversation, analytics
+from app.api.v1.endpoints import auth, employees, managers, hr, ai,unified_conversation, analytics, policy_routes
 
 api_router = APIRouter()
 
@@ -15,4 +15,8 @@ api_router.include_router(
 api_router.include_router(
     analytics.router,
     tags=["analytics"]
+)
+api_router.include_router(
+    policy_routes.router,
+    tags=["policy"]
 )

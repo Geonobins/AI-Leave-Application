@@ -1,4 +1,5 @@
-import { BarChart2, FileText, Home, Users, UserCog } from "lucide-react";
+// components/layout/Sidebar.tsx
+import { BarChart2, FileText, Home, Users, UserCog, Shield } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { useAppSelector } from "../../store/hooks";
 
@@ -20,6 +21,7 @@ const Sidebar = () => {
       { to: '/analytics', icon: <BarChart2 className="w-5 h-5" />, label: 'Analytics' },
       { to: '/manage-balances', icon: <FileText className="w-5 h-5" />, label: 'Manage Balances' },
       { to: '/manage-users', icon: <UserCog className="w-5 h-5" />, label: 'Manage Users' },
+      { to: '/manage-policies', icon: <Shield className="w-5 h-5" />, label: 'Policy Management' },
     ]
   };
 
@@ -29,11 +31,7 @@ const Sidebar = () => {
   ];
 
   return (
-    <aside className="bg-white  w-64 min-h-screen shadow-lg">
-      {/* <div className="p-6">
-        <h2 className="text-2xl font-bold text-blue-600">Leave System</h2>
-      </div> */}
-      
+    <aside className="bg-white w-64 min-h-screen shadow-lg">
       <nav className="p-4">
         {links.map((link) => (
           <NavLink

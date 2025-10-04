@@ -7,6 +7,8 @@ from app.models.leave import Leave, LeaveStatus
 from app.api.deps import get_current_user
 from app.services.unified_ai_service import UnifiedAIService
 from app.schemas.leave import ConversationRequest, ConversationResponse
+from app.services.policy_rag_service import PolicyRAGService
+
 
 router = APIRouter()
 
@@ -168,8 +170,43 @@ def _handle_leave_request(
     parsed: Dict,
     ai_service: UnifiedAIService
 ) -> Dict:
-    """Handle leave request with AI-suggested responsible person"""
+    """Handle leave request with AI-suggested responsible person AND policy compliance check"""
     from datetime import datetime
+    from app.config import settings
+    
+    # Calculate notice period
+    notice_days = 0
+    if parsed.get("start_date"):
+        notice_days = (parsed["start_date"] - datetime.now().date()).days
+        parsed["notice_days"] = notice_days
+    
+    # POLICY COMPLIANCE CHECK - This is the key addition
+    policy_compliance = None
+    if parsed.get("is_complete") and parsed.get("start_date") and parsed.get("end_date"):
+        try:
+            rag_service = PolicyRAGService(db, settings.GROQ_API_KEY)
+            
+            user_context = {
+                "user_id": current_user.id,
+                "role": current_user.role.value,
+                "department": current_user.department,
+                "position": current_user.position
+            }
+            
+            policy_compliance = rag_service.check_policy_compliance(
+                leave_request=parsed,
+                user_context=user_context
+            )
+            
+            # If there are violations, mark as needs clarification
+            if not policy_compliance.get("compliant"):
+                parsed["needs_clarification"] = True
+                parsed["is_complete"] = False
+                
+        except Exception as e:
+            print(f"Policy compliance check failed: {e}")
+            # Continue without policy check if it fails
+            policy_compliance = None
     
     # Get suggested responsible persons using AI
     suggested_persons = []
@@ -261,14 +298,17 @@ def _handle_leave_request(
             "available": balance.available if balance else 0
         } if balance else None,
         "is_complete": parsed.get("is_complete", False),
-        "needs_clarification": parsed.get("needs_clarification", False)
+        "needs_clarification": parsed.get("needs_clarification", False),
+        "policy_compliance": policy_compliance  # NEW: Include policy compliance
     }
 
 
+# Update _handle_approval to check policy compliance before approving
 def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
-    """Handle leave approval/rejection"""
+    """Handle leave approval/rejection WITH policy compliance check"""
     from datetime import datetime
     from app.models.leave_balance import LeaveBalance
+    from app.config import settings
     
     leave_id = parsed.get("leave_id")
     action = parsed.get("action")
@@ -316,6 +356,48 @@ def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
             "message": f"Leave is already {leave.status.value.lower()}"
         }
     
+    # POLICY COMPLIANCE CHECK BEFORE APPROVAL
+    if action == "APPROVE":
+        try:
+            rag_service = PolicyRAGService(db, settings.GROQ_API_KEY)
+            
+            user_context = {
+                "user_id": employee.id,
+                "role": employee.role.value,
+                "department": employee.department,
+                "position": employee.position
+            }
+            
+            leave_request_dict = {
+                "leave_type": leave.leave_type.value,
+                "start_date": leave.start_date,
+                "end_date": leave.end_date,
+                "reason": leave.reason,
+                "notice_days": (leave.start_date - leave.created_at.date()).days
+            }
+            
+            policy_compliance = rag_service.check_policy_compliance(
+                leave_request=leave_request_dict,
+                user_context=user_context
+            )
+            
+            # If policy violations exist, prevent approval
+            if not policy_compliance.get("compliant"):
+                violations = policy_compliance.get("violations", [])
+                return {
+                    "success": False,
+                    "message": "Cannot approve: Policy violations detected",
+                    "violations": violations,
+                    "relevant_policies": policy_compliance.get("relevant_policies", [])
+                }
+            
+            # Show warnings but allow approval
+            warnings = policy_compliance.get("warnings", [])
+            
+        except Exception as e:
+            print(f"Policy compliance check failed during approval: {e}")
+            warnings = []
+    
     # Update leave status
     if action == "APPROVE":
         leave.status = LeaveStatus.APPROVED
@@ -341,7 +423,7 @@ def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
     
     db.commit()
     
-    return {
+    result = {
         "success": True,
         "action": action.lower(),
         "leave": {
@@ -352,6 +434,11 @@ def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
             "status": leave.status.value
         }
     }
+    
+    if action == "APPROVE" and warnings:
+        result["warnings"] = warnings
+    
+    return result
 
 
 def _handle_leave_query(
