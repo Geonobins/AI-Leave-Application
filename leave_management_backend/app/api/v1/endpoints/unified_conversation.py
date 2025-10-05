@@ -13,7 +13,6 @@ from app.services.policy_rag_service import PolicyRAGService
 router = APIRouter()
 
 @router.post("/conversation", response_model=ConversationResponse)
-@router.post("/conversation", response_model=ConversationResponse)
 def unified_conversation(
     request: ConversationRequest,
     db: Session = Depends(get_db),
@@ -170,7 +169,7 @@ def _handle_leave_request(
     parsed: Dict,
     ai_service: UnifiedAIService
 ) -> Dict:
-    """Handle leave request with AI-suggested responsible person AND policy compliance check"""
+    """Handle leave request with AI-suggested responsible person and policy warnings"""
     from datetime import datetime
     from app.config import settings
     
@@ -180,7 +179,7 @@ def _handle_leave_request(
         notice_days = (parsed["start_date"] - datetime.now().date()).days
         parsed["notice_days"] = notice_days
     
-    # POLICY COMPLIANCE CHECK - This is the key addition
+    # POLICY COMPLIANCE CHECK - Only show warnings, never block employee submission
     policy_compliance = None
     if parsed.get("is_complete") and parsed.get("start_date") and parsed.get("end_date"):
         try:
@@ -198,10 +197,13 @@ def _handle_leave_request(
                 user_context=user_context
             )
             
-            # If there are violations, mark as needs clarification
+            # CRITICAL: Don't block employee submission based on policy violations
+            # Just attach warnings for informational purposes
+            # Policy enforcement happens at manager approval stage
             if not policy_compliance.get("compliant"):
-                parsed["needs_clarification"] = True
-                parsed["is_complete"] = False
+                parsed["policy_warnings"] = policy_compliance.get("violations", [])
+                # DO NOT set needs_clarification or is_complete to False
+                # Let employees submit ANY request, managers will enforce policy during approval
                 
         except Exception as e:
             print(f"Policy compliance check failed: {e}")
@@ -299,13 +301,12 @@ def _handle_leave_request(
         } if balance else None,
         "is_complete": parsed.get("is_complete", False),
         "needs_clarification": parsed.get("needs_clarification", False),
-        "policy_compliance": policy_compliance  # NEW: Include policy compliance
+        "policy_compliance": policy_compliance  # Include for informational purposes only
     }
 
 
-# Update _handle_approval to check policy compliance before approving
 def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
-    """Handle leave approval/rejection WITH policy compliance check"""
+    """Handle leave approval/rejection WITH strict policy enforcement"""
     from datetime import datetime
     from app.models.leave_balance import LeaveBalance
     from app.config import settings
@@ -356,7 +357,8 @@ def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
             "message": f"Leave is already {leave.status.value.lower()}"
         }
     
-    # POLICY COMPLIANCE CHECK BEFORE APPROVAL
+    # STRICT POLICY ENFORCEMENT - Block approval if violations exist
+    warnings = []
     if action == "APPROVE":
         try:
             rag_service = PolicyRAGService(db, settings.GROQ_API_KEY)
@@ -381,22 +383,41 @@ def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
                 user_context=user_context
             )
             
-            # If policy violations exist, prevent approval
+            # If critical policy violations exist, BLOCK approval
             if not policy_compliance.get("compliant"):
                 violations = policy_compliance.get("violations", [])
-                return {
-                    "success": False,
-                    "message": "Cannot approve: Policy violations detected",
-                    "violations": violations,
-                    "relevant_policies": policy_compliance.get("relevant_policies", [])
-                }
+                
+                # Filter out non-critical violations (informational only)
+                critical_violations = []
+                for v in violations:
+                    v_lower = v.lower()
+                    # Skip informational violations that shouldn't block approval
+                    if any(skip in v_lower for skip in [
+                        "leave balance is not visible",
+                        "approval hierarchy",
+                        "documentation requirements",
+                        "reason for leave is not provided"
+                    ]):
+                        warnings.append(v)
+                    else:
+                        critical_violations.append(v)
+                
+                if critical_violations:
+                    return {
+                        "success": False,
+                        "message": "Cannot approve: Policy violations detected",
+                        "violations": critical_violations,
+                        "relevant_policies": policy_compliance.get("relevant_policies", [])
+                    }
             
-            # Show warnings but allow approval
-            warnings = policy_compliance.get("warnings", [])
+            # Collect non-blocking warnings
+            if policy_compliance.get("warnings"):
+                warnings.extend(policy_compliance.get("warnings", []))
             
         except Exception as e:
             print(f"Policy compliance check failed during approval: {e}")
-            warnings = []
+            # If policy check fails, allow approval with warning
+            warnings.append("Policy compliance check unavailable")
     
     # Update leave status
     if action == "APPROVE":
@@ -435,7 +456,7 @@ def _handle_approval(db: Session, current_user: User, parsed: Dict) -> Dict:
         }
     }
     
-    if action == "APPROVE" and warnings:
+    if warnings:
         result["warnings"] = warnings
     
     return result

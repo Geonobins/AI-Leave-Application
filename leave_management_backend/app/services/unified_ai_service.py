@@ -109,6 +109,29 @@ FOR APPROVE_REJECT, extract:
 - comments: approval/rejection comments
 - status: PENDING (when checking approvals)
 
+CRITICAL PARSING RULES:
+1. NEVER assume leave_type - it must be explicitly stated by user
+2. NEVER mark is_complete=true if leave_type is missing
+3. ALWAYS set needs_clarification=true if ANY required field is missing
+4. Required fields for REQUEST_LEAVE: leave_type, start_date, end_date
+
+LEAVE TYPE DETECTION (must be explicitly mentioned):
+- "sick leave" / "sick" → SICK
+- "casual leave" / "casual" → CASUAL  
+- "annual leave" / "vacation" / "annual" → ANNUAL
+- "maternity" → MATERNITY
+- "paternity" → PATERNITY
+- If NONE of these words appear → leave_type: null
+
+If leave_type is null:
+{{
+    "is_complete": false,
+    "needs_clarification": true,
+    "clarification_question": "What type of leave do you need? (Sick, Casual, Annual, etc.)"
+}}
+
+NEVER default to CASUAL or any other type if not explicitly mentioned.
+
 FOR QUERY_LEAVES, extract:
 - date_filter: {{"type": "TODAY", "THIS_WEEK", "THIS_MONTH", "DATE_RANGE", "SPECIFIC_DATE"}} or null
 - department: Frontend, Backend, HR, Design
@@ -342,29 +365,34 @@ Respond ONLY with valid JSON:
         """Check if leave request has all required fields"""
         missing = []
         
+        # Check leave_type first
         if not parsed.get("leave_type"):
             missing.append("leave_type")
             parsed["clarification_question"] = "What type of leave do you need? (Sick, Casual, Annual, etc.)"
             parsed["needs_clarification"] = True
-        elif not parsed.get("start_date"):
+            parsed["is_complete"] = False
+            parsed["missing_fields"] = missing
+            return parsed  # Return early - don't check other fields yet
+        
+        # Only check dates if leave_type exists
+        if not parsed.get("start_date"):
             missing.append("start_date")
-            parsed["clarification_question"] = "When would you like to start your leave? (e.g., tomorrow, Oct 5)"
+            parsed["clarification_question"] = "When would you like to start your leave?"
             parsed["needs_clarification"] = True
+            parsed["is_complete"] = False
         elif not parsed.get("end_date"):
-            missing.append("end_date")
-            # Auto-set end_date to start_date for single day
-            if parsed.get("start_date"):
-                parsed["end_date"] = parsed["start_date"]
-                parsed["clarification_question"] = f"Your leave is set for {parsed['start_date'].strftime('%B %d')}. Is this just for one day?"
-                parsed["needs_clarification"] = True
+            # Auto-set end_date to start_date for single day (this is fine)
+            parsed["end_date"] = parsed["start_date"]
         
         parsed["missing_fields"] = missing
         
+        # Only mark complete if ALL required fields present
         if parsed.get("leave_type") and parsed.get("start_date") and parsed.get("end_date"):
             parsed["is_complete"] = True
             parsed["needs_clarification"] = False
         else:
             parsed["is_complete"] = False
+            parsed["needs_clarification"] = True
         
         return parsed
     

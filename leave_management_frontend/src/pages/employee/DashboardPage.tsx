@@ -393,7 +393,7 @@ const DashboardPage = () => {
         </h2>
         {leaves.length > 0 ? (
           <div className="space-y-3">
-            {leaves.slice(0, 5).map((leave) => (
+            {leaves.map((leave) => (
               <div
                 key={leave.id}
                 className="flex items-center justify-between p-3 border border-gray-200 rounded-lg"

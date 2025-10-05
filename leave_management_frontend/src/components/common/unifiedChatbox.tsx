@@ -1,17 +1,9 @@
 // components/common/UnifiedChatBox.tsx
 import { useState, useRef, useEffect } from 'react';
-import { Send, CheckCircle } from 'lucide-react';
-import { useAppSelector } from '../../store/hooks';
+import { Send, CheckCircle, AlertCircle, AlertTriangle, ChevronDown, ChevronUp } from 'lucide-react';
+import { useAppDispatch, useAppSelector } from '../../store/hooks';
 import { employeesApi } from '../../api';
-
-// interface LeaveData {
-//   leave_type?: string;
-//   start_date?: string;
-//   end_date?: string;
-//   reason?: string;
-//   is_complete?: boolean;
-//   needs_clarification?: boolean;
-// }
+import { fetchBalances, fetchLeaves } from '../../features/leaves/leavesSlice';
 
 interface PendingLeave {
   leave_type: string;
@@ -27,6 +19,113 @@ interface PendingLeave {
   }>;
 }
 
+interface PolicyCompliance {
+  compliant: boolean;
+  violations: string[];
+  warnings?: string[];
+  relevant_policies?: any[];
+}
+
+// Policy Compliance Badge Component
+const PolicyComplianceBadge = ({ compliance }: { compliance: PolicyCompliance }) => {
+  const [showDetails, setShowDetails] = useState(false);
+
+  if (compliance.compliant) {
+    return (
+      <div className="mt-3 ml-4 max-w-[70%]">
+        <div className="flex items-center gap-2 p-3 bg-green-50 border border-green-200 rounded-lg">
+          <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0" />
+          <span className="text-sm font-medium text-green-800">Policy Compliant ✓</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 ml-4 max-w-[70%] space-y-2">
+      {/* Main violation badge */}
+      <div className="bg-red-50 border border-red-200 rounded-lg">
+        <button
+          onClick={() => setShowDetails(!showDetails)}
+          className="w-full flex items-center justify-between gap-2 p-3 hover:bg-red-100 transition-colors"
+        >
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0" />
+            <span className="text-sm font-medium text-red-800">
+              {compliance.violations.length} Policy Violation{compliance.violations.length !== 1 ? 's' : ''} Detected
+            </span>
+          </div>
+          {showDetails ? (
+            <ChevronUp className="w-4 h-4 text-red-600" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-red-600" />
+          )}
+        </button>
+
+        {showDetails && (
+          <div className="border-t border-red-200 p-3 space-y-3">
+            {/* Violations list */}
+            <div>
+              <h4 className="text-xs font-semibold text-red-900 mb-2 uppercase">Violations:</h4>
+              <ul className="space-y-1 max-h-40 overflow-y-auto">
+                {compliance.violations.slice(0, 5).map((violation, index) => (
+                  <li key={index} className="text-xs text-red-700 flex items-start gap-2">
+                    <span className="text-red-500 mt-0.5">•</span>
+                    <span>{violation}</span>
+                  </li>
+                ))}
+                {compliance.violations.length > 5 && (
+                  <li className="text-xs text-red-600 italic pl-3">
+                    +{compliance.violations.length - 5} more violations
+                  </li>
+                )}
+              </ul>
+            </div>
+
+            {/* Warnings if present */}
+            {compliance.warnings && compliance.warnings.length > 0 && (
+              <div className="pt-2 border-t border-red-200">
+                <h4 className="text-xs font-semibold text-yellow-900 mb-2 uppercase flex items-center gap-1">
+                  <AlertTriangle className="w-3 h-3" />
+                  Warnings:
+                </h4>
+                <ul className="space-y-1 max-h-32 overflow-y-auto">
+                  {compliance.warnings.slice(0, 3).map((warning, index) => (
+                    <li key={index} className="text-xs text-yellow-700 flex items-start gap-2">
+                      <span className="text-yellow-500 mt-0.5">⚠</span>
+                      <span>{warning}</span>
+                    </li>
+                  ))}
+                  {compliance.warnings.length > 3 && (
+                    <li className="text-xs text-yellow-600 italic pl-3">
+                      +{compliance.warnings.length - 3} more warnings
+                    </li>
+                  )}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Compact badges */}
+      <div className="flex flex-wrap gap-2">
+        <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-red-100 text-red-800">
+          <AlertCircle className="w-3 h-3 mr-1" />
+          {compliance.violations.length} Violations
+        </span>
+        
+        {compliance.warnings && compliance.warnings.length > 0 && (
+          <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
+            <AlertTriangle className="w-3 h-3 mr-1" />
+            {compliance.warnings.length} Warnings
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const UnifiedChatBox = () => {
   const { user } = useAppSelector((state) => state.auth);
   const [messages, setMessages] = useState<any[]>([]);
@@ -36,6 +135,7 @@ const UnifiedChatBox = () => {
   const [pendingLeave, setPendingLeave] = useState<PendingLeave | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const dispatch = useAppDispatch();
 
   useEffect(() => {
     const initialSuggestions = getRoleSuggestions(user?.role);
@@ -111,7 +211,6 @@ const UnifiedChatBox = () => {
 
     setSubmitting(true);
     try {
-      // Call the actual POST endpoint
       await employeesApi.createLeave({
         leave_type: pendingLeave.leave_type,
         start_date: pendingLeave.start_date,
@@ -120,22 +219,22 @@ const UnifiedChatBox = () => {
         responsible_person_id: pendingLeave.responsible_person_id,
       });
 
-      // Show success message
       const successMessage = {
         role: 'assistant',
-        content: '✅ Your leave request has been submitted successfully! Your manager will review it soon.',
+        content: '✓ Your leave request has been submitted successfully! Your manager will review it soon.',
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, successMessage]);
       
-      // Clear pending leave
       setPendingLeave(null);
       setSuggestions(['Check my leaves', 'Check my balance']);
+      dispatch(fetchLeaves());
+      dispatch(fetchBalances());
     } catch (error: any) {
       console.error('Submit error:', error);
       const errorMessage = {
         role: 'assistant',
-        content: `❌ Failed to submit: ${error.response?.data?.detail || 'Unknown error'}`,
+        content: `Failed to submit: ${error.response?.data?.detail || 'Unknown error'}`,
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, errorMessage]);
@@ -177,9 +276,7 @@ const UnifiedChatBox = () => {
 
         {messages.map((msg, idx) => (
           <div key={idx}>
-            <div
-              className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-            >
+            <div className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
               <div
                 className={`max-w-[70%] rounded-2xl px-4 py-3 ${
                   msg.role === 'user'
@@ -190,6 +287,11 @@ const UnifiedChatBox = () => {
                 <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
               </div>
             </div>
+
+            {/* Policy Compliance Badge */}
+            {msg.intent === 'REQUEST_LEAVE' && msg.data?.policy_compliance && (
+              <PolicyComplianceBadge compliance={msg.data.policy_compliance} />
+            )}
 
             {/* Show responsible person selection */}
             {msg.intent === 'REQUEST_LEAVE' && 
@@ -224,10 +326,10 @@ const UnifiedChatBox = () => {
               </div>
             )}
 
-            {/* Show submit button when leave is complete */}
+            {/* Show submit button - only if pendingLeave exists */}
             {msg.intent === 'REQUEST_LEAVE' && 
              msg.data?.is_complete && 
-             (
+             pendingLeave && (
               <div className="mt-3 ml-4">
                 <button
                   onClick={handleSubmitLeave}
@@ -247,8 +349,8 @@ const UnifiedChatBox = () => {
             <div className="bg-gray-100 rounded-2xl px-4 py-3">
               <div className="flex gap-1">
                 <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" />
-                <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce delay-100" />
-                <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce delay-200" />
+                <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }} />
+                <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
               </div>
             </div>
           </div>
