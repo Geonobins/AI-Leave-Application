@@ -31,17 +31,17 @@ const Sidebar = () => {
   ];
 
   return (
-    <aside className="bg-white w-64 min-h-screen shadow-lg">
+    <aside className="backdrop-blur-md bg-transparent w-64 min-h-screen shadow-lg ">
       <nav className="p-4">
         {links.map((link) => (
           <NavLink
             key={link.to}
             to={link.to}
             className={({ isActive }) =>
-              `flex items-center gap-3 px-4 py-3 rounded-lg transition-colors mb-1 ${
+              `flex items-center gap-3 px-4 py-3 rounded-lg transition-colors mb-1 text-white ${
                 isActive
-                  ? 'bg-blue-50 text-blue-600 font-medium'
-                  : 'text-gray-700 hover:bg-gray-100'
+                  ? ' text--600 font-medium'
+                  : ''
               }`
             }
           >

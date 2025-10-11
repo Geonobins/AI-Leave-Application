@@ -11,4 +11,11 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  server: {
+    // Set host to '0.0.0.0' to listen on all local IPs,
+    // making it accessible over the network (e.g., from your mobile).
+    host: '0.0.0.0', 
+    // You can optionally keep or specify the port
+    port: 5173,
+  },
 })

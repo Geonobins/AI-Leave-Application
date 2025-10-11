@@ -14,7 +14,7 @@ interface UIState {
 }
 
 const initialState: UIState = {
-  sidebarOpen: true,
+  sidebarOpen: false,
   toasts: [],
   modalOpen: false,
   modalContent: null,

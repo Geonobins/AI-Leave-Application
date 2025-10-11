@@ -149,11 +149,15 @@ def unified_conversation(
                 
                 actions.append(action_text)
         
+        # Add UI state for dynamic component rendering
+        ui_state = parsed.get("ui_state", {})
+        
         return ConversationResponse(
             response=response_text,
             intent=intent,
             data=result,
-            actions=actions
+            actions=actions,
+            ui_state=ui_state  # New field for UI rendering
         )
     
     except HTTPException:

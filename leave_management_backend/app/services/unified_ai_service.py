@@ -2,15 +2,103 @@ from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional
 import json
 import requests
+import time
+from functools import wraps
 from app.models.leave import LeaveType, LeaveStatus
 from app.config import settings
 
+def retry_with_backoff(max_retries=3, base_delay=2):
+    """Decorator for exponential backoff retry logic"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except requests.exceptions.RequestException as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    
+                    # Check if it's a rate limit error
+                    if hasattr(e, 'response') and e.response is not None:
+                        if e.response.status_code == 429:
+                            # Extract wait time from error message
+                            try:
+                                error_data = e.response.json()
+                                error_msg = error_data.get('error', {}).get('message', '')
+                                if 'Please try again in' in error_msg:
+                                    # Parse wait time from message
+                                    wait_time = float(error_msg.split('Please try again in ')[1].split('s')[0])
+                                    print(f"Rate limited. Waiting {wait_time}s before retry...")
+                                    time.sleep(wait_time + 0.5)  # Add buffer
+                                    continue
+                            except:
+                                pass
+                    
+                    # Exponential backoff
+                    wait_time = base_delay * (2 ** attempt)
+                    print(f"Request failed (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+            
+            return None
+        return wrapper
+    return decorator
+
+
 class UnifiedAIService:
-    """Unified AI Service for all leave management conversations"""
+    """Unified AI Service with enhanced error handling and rate limit management"""
     
     def __init__(self):
         self.groq_api_key = settings.GROQ_API_KEY
         self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+        self._last_request_time = 0
+        self._min_request_interval = 1.0  # Minimum 1 second between requests
+    
+    def _rate_limit_wait(self):
+        """Implement client-side rate limiting"""
+        current_time = time.time()
+        time_since_last = current_time - self._last_request_time
+        
+        if time_since_last < self._min_request_interval:
+            wait_time = self._min_request_interval - time_since_last
+            time.sleep(wait_time)
+        
+        self._last_request_time = time.time()
+    
+    @retry_with_backoff(max_retries=3, base_delay=2)
+    def _make_groq_request(self, messages: List[Dict], temperature: float = 0.1, 
+                          max_tokens: int = 500, response_format: Dict = None) -> Optional[Dict]:
+        """Make a request to Groq API with retry logic"""
+        self._rate_limit_wait()
+        
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        if response_format:
+            payload["response_format"] = response_format
+        
+        response = requests.post(
+            self.api_url,
+            headers={
+                "Authorization": f"Bearer {self.groq_api_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=15
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 429:
+            # Rate limit error - let retry decorator handle it
+            raise requests.exceptions.RequestException(response=response)
+        else:
+            print(f"Groq API Error: {response.status_code} - {response.text}")
+            return None
     
     def parse_conversation(
         self,
@@ -18,310 +106,338 @@ class UnifiedAIService:
         chat_history: List[Dict],
         user_context: Dict
     ) -> Dict:
-        """
-        Parse any leave management conversation and determine intent.
-        Works for all user roles (Employee, Manager, HR)
-        """
+        """Parse leave management conversation with optimized prompts"""
         
         today = datetime.now().date()
         
-        system_prompt = f"""You are an intelligent assistant for leave management system.
+        # OPTIMIZED: Condensed system prompt to reduce token usage
+        system_prompt = f"""AI assistant for leave management. Today: {today.strftime('%Y-%m-%d')}
 
-USER CONTEXT (CRITICAL FOR INTENT DETECTION):
-- Role: {user_context['role']}
-- Department: {user_context['department']}
-- Position: {user_context['position']}
-- Is Manager: {user_context['is_manager']}
-- Is HR: {user_context['is_hr']}
-- User Name: {user_context['full_name']}
-
-Today's date: {today.strftime('%Y-%m-%d')} ({today.strftime('%A')})
-
-ROLE-BASED INTENT RULES:
-
-For EMPLOYEES (non-managers):
-- Cannot approve/reject leaves
-- "pending requests" means THEIR OWN pending leaves
-- "need approval" means THEIR OWN leaves awaiting manager approval
-- Cannot view team status or analytics
-- Can query policies (QUERY_POLICY)
-
-For MANAGERS/HR:
-- Can approve/reject leaves
-- "pending requests" means LEAVES AWAITING THEIR APPROVAL
-- Can view team status and department data
-- Can query policies (QUERY_POLICY)
-
-Determine the INTENT and extract relevant information:
+USER: {user_context['role']} - {user_context['full_name']} (Manager: {user_context['is_manager']}, HR: {user_context['is_hr']})
 
 INTENTS:
-1. REQUEST_LEAVE - User wants to request leave
-2. APPROVE_REJECT - Approve or reject someone's leave (MANAGERS/HR ONLY)
+1. REQUEST_LEAVE - Request leave (requires: leave_type, start_date, end_date)
+2. APPROVE_REJECT - Approve/reject (Managers/HR only)
 3. QUERY_LEAVES - Query leave records
-4. CHECK_BALANCE - Check leave balances
-5. TEAM_STATUS - Check team availability (MANAGERS/HR ONLY)
-6. ANALYTICS - View analytics (HR ONLY)
-7. QUERY_POLICY - Ask about company policies (ALL USERS)
-8. GENERAL - General question or greeting
+4. CHECK_BALANCE - Check balances
+5. TEAM_STATUS - Team availability (Managers/HR)
+6. ANALYTICS - Analytics (HR only)
+7. QUERY_POLICY - Policy questions (all users)
+8. GENERAL - General/greeting
 
-NEW INTENT - QUERY_POLICY:
-- "what is the leave policy"
-- "summarize leave policy"
-- "tell me about sick leave policy"
-- "what are the rules for annual leave"
-- "how many days notice do I need"
-- "can I take leave in December"
-- "what's the policy on maternity leave"
-- Any question about policies, rules, guidelines, requirements
+ROLE RULES:
+- Employees: Can only view own data, request leaves
+- Managers: Can approve leaves, view team data
+- HR: Full access to all data
 
-FOR QUERY_POLICY, extract:
-- policy_query: the actual question about the policy
-- policy_type: LEAVE, SICK, ANNUAL, CASUAL, MATERNITY, PATERNITY, GENERAL
+LEAVE TYPES: SICK, CASUAL, ANNUAL, MATERNITY, PATERNITY, UNPAID
 
-SPECIAL ROLE-BASED CASES:
+CRITICAL:
+- NEVER assume leave_type - must be explicit
+- For REQUEST_LEAVE: needs_clarification=true if ANY required field missing
+- Employees: "pending" means THEIR pending leaves
+- Managers: "pending" means leaves AWAITING approval
 
-For {user_context['full_name']} (Role: {user_context['role']}):
-
-IF USER IS EMPLOYEE (non-manager):
-- "pending requests I should approve" → QUERY_LEAVES with status: PENDING, employee_name: "{user_context['full_name']}"
-- "need my approval" → QUERY_LEAVES with status: PENDING, employee_name: "{user_context['full_name']}"
-- "awaiting approval" → QUERY_LEAVES with status: PENDING, employee_name: "{user_context['full_name']}"
-- "what needs approval" → QUERY_LEAVES with status: PENDING, employee_name: "{user_context['full_name']}"
-
-IF USER IS MANAGER/HR:
-- "pending requests I should approve" → APPROVE_REJECT with action: CHECK_PENDING
-- "need my approval" → APPROVE_REJECT with action: CHECK_PENDING
-- "awaiting approval" → APPROVE_REJECT with action: CHECK_PENDING
-
-FOR REQUEST_LEAVE, extract:
-- leave_type: SICK, CASUAL, ANNUAL, MATERNITY, PATERNITY, UNPAID
-- start_date: YYYY-MM-DD
-- end_date: YYYY-MM-DD
-- reason: brief description
-- is_complete: true if all required fields present
-- needs_clarification: true if missing info
-- clarification_question: what to ask next
-
-FOR APPROVE_REJECT, extract:
-- action: APPROVE, REJECT, or CHECK_PENDING
-- leave_id: if mentioned
-- employee_name: if no leave_id
-- comments: approval/rejection comments
-- status: PENDING (when checking approvals)
-
-CRITICAL PARSING RULES:
-1. NEVER assume leave_type - it must be explicitly stated by user
-2. NEVER mark is_complete=true if leave_type is missing
-3. ALWAYS set needs_clarification=true if ANY required field is missing
-4. Required fields for REQUEST_LEAVE: leave_type, start_date, end_date
-
-LEAVE TYPE DETECTION (must be explicitly mentioned):
-- "sick leave" / "sick" → SICK
-- "casual leave" / "casual" → CASUAL  
-- "annual leave" / "vacation" / "annual" → ANNUAL
-- "maternity" → MATERNITY
-- "paternity" → PATERNITY
-- If NONE of these words appear → leave_type: null
-
-If leave_type is null:
-{{
-    "is_complete": false,
-    "needs_clarification": true,
-    "clarification_question": "What type of leave do you need? (Sick, Casual, Annual, etc.)"
-}}
-
-NEVER default to CASUAL or any other type if not explicitly mentioned.
-
-FOR QUERY_LEAVES, extract:
-- date_filter: {{"type": "TODAY", "THIS_WEEK", "THIS_MONTH", "DATE_RANGE", "SPECIFIC_DATE"}} or null
-- department: Frontend, Backend, HR, Design
-- employee_name: specific employee
-- status: PENDING, APPROVED, REJECTED
-- leave_type: specific type
-
-DATE PARSING RULES:
+DATE PARSING:
 - "tomorrow" = {(today + timedelta(days=1)).strftime('%Y-%m-%d')}
-- "next Monday" = calculate next Monday's date
-- "3 days" = 3 days starting tomorrow unless specified
+- "today" = {today.strftime('%Y-%m-%d')}
+- "next Monday" = calculate next Monday
 - "this week" = THIS_WEEK filter
-- "today" = TODAY filter
 
-SUGGESTED ACTIONS:
-- For employees: ["Check my leaves", "Request leave", "View balance"]
-- For managers: ["View pending approvals", "Check team status", "Approve leaves"]
-- For HR: ["View analytics", "Department report", "Process leaves"]
-
-Respond ONLY with valid JSON:
+Response JSON:
 {{
-    "intent": "QUERY_POLICY",
-    "policy_query": "what is the leave policy",
-    "policy_type": "LEAVE",
+    "intent": "REQUEST_LEAVE|APPROVE_REJECT|QUERY_LEAVES|CHECK_BALANCE|TEAM_STATUS|ANALYTICS|QUERY_POLICY|GENERAL",
     "leave_type": null,
     "start_date": null,
     "end_date": null,
     "reason": null,
     "is_complete": false,
     "needs_clarification": false,
+    "clarification_question": null,
     "action": null,
     "leave_id": null,
     "employee_name": null,
-    "date_filter": null,
-    "department": null,
     "status": null,
-    "suggested_actions": ["Request leave", "Check balance", "View my leaves"]
+    "department": null,
+    "date_filter": null,
+    "policy_query": null,
+    "policy_type": null,
+    "ui_state": {{
+        "component": "GREETING|TYPE_SELECTOR|DATE_PICKER|TEXT_INPUT|PERSON_SELECTOR|CONFIRMATION_CARD|STATUS_CARD|LEAVE_LIST|BALANCE_CARD|POLICY_CARD",
+        "stage": "GREETING|TYPE_SELECTION|DATE_SELECTION|REASON_INPUT|RESPONSIBLE_PERSON|CONFIRMATION|FINAL_REVIEW|VIEWING",
+        "awaiting_input": null,
+        "show_calendar": false,
+        "show_type_options": false,
+        "show_quick_actions": false,
+        "collected_data": {{}}
+    }},
+    "suggested_actions": []
 }}"""
 
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add chat history (last 5 messages)
-        for msg in chat_history[-5:]:
+        # Only include last 3 messages to reduce tokens
+        for msg in chat_history[-3:]:
             messages.append({
                 "role": msg.get("role", "user"),
-                "content": msg.get("content", "")
+                "content": msg.get("content", "")[:200]  # Truncate long messages
             })
         
-        messages.append({"role": "user", "content": text})
+        messages.append({"role": "user", "content": text[:300]})  # Limit user input
+        
+        is_first_message = len(chat_history) == 0 or (len(chat_history) == 1 and "welcome" in chat_history[0].get("content", "").lower())
         
         try:
-            response = requests.post(
-                self.api_url,
-                headers={
-                    "Authorization": f"Bearer {self.groq_api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": messages,
-                    "temperature": 0.1,
-                    "response_format": {"type": "json_object"}
-                },
-                timeout=10
+            result = self._make_groq_request(
+                messages=messages,
+                temperature=0.1,
+                max_tokens=400,  # Reduced from default
+                response_format={"type": "json_object"}
             )
             
-            if response.status_code == 200:
-                result = response.json()
+            if not result:
+                print("No response from Groq API, using fallback")
+                return self._fallback_parse(text, user_context)
+            
+            content = result["choices"][0]["message"]["content"]
+            
+            try:
+                parsed = json.loads(content) if isinstance(content, str) else content
+            except json.JSONDecodeError as e:
+                print(f"JSON parsing failed: {e}")
+                return self._fallback_parse(text, user_context)
+            
+            if not isinstance(parsed, dict):
+                return self._fallback_parse(text, user_context)
+            
+            # Process dates and leave types
+            parsed = self._process_parsed_data(parsed, user_context, is_first_message, text)
+            
+            return parsed
                 
-                # FIX: Handle cases where API returns string instead of JSON
-                content = result["choices"][0]["message"]["content"]
-                
-                # Try to parse as JSON, fallback if it's a string or invalid JSON
+        except Exception as e:
+            print(f"Parse conversation error: {e}")
+            return self._fallback_parse(text, user_context)
+    
+    def _process_parsed_data(self, parsed: Dict, user_context: Dict, 
+                            is_first_message: bool, text: str) -> Dict:
+        """Process and validate parsed data"""
+        
+        # Convert date strings to date objects
+        for date_field in ['start_date', 'end_date']:
+            if parsed.get(date_field) and isinstance(parsed[date_field], str):
                 try:
-                    if isinstance(content, str):
-                        parsed = json.loads(content)
-                    else:
-                        parsed = content
-                        
-                except (json.JSONDecodeError, TypeError) as e:
-                    print(f"JSON parsing failed, using fallback parser: {e}")
-                    print(f"Raw content: {content}")
-                    return self._fallback_parse(text, user_context)
-                
-                # Ensure parsed is a dictionary
-                if not isinstance(parsed, dict):
-                    print(f"Parsed content is not a dictionary: {type(parsed)}")
-                    return self._fallback_parse(text, user_context)
-                
-                # Convert date strings to date objects with error handling
-                if parsed.get("start_date"):
+                    parsed[date_field] = datetime.strptime(
+                        parsed[date_field], "%Y-%m-%d"
+                    ).date()
+                except:
+                    parsed[date_field] = None
+        
+        # Handle date_filter dates
+        if parsed.get("date_filter") and isinstance(parsed["date_filter"], dict):
+            for date_field in ['start_date', 'end_date']:
+                date_val = parsed["date_filter"].get(date_field)
+                if date_val and isinstance(date_val, str):
                     try:
-                        if isinstance(parsed["start_date"], str):
-                            parsed["start_date"] = datetime.strptime(
-                                parsed["start_date"], "%Y-%m-%d"
-                            ).date()
-                    except (ValueError, TypeError) as e:
-                        print(f"Error parsing start_date: {e}")
-                        parsed["start_date"] = None
-                
-                if parsed.get("end_date"):
-                    try:
-                        if isinstance(parsed["end_date"], str):
-                            parsed["end_date"] = datetime.strptime(
-                                parsed["end_date"], "%Y-%m-%d"
-                            ).date()
-                    except (ValueError, TypeError) as e:
-                        print(f"Error parsing end_date: {e}")
-                        parsed["end_date"] = None
-                
-                # Handle date_filter dates with error handling
-                if parsed.get("date_filter") and isinstance(parsed["date_filter"], dict):
-                    date_filter = parsed["date_filter"]
-                    
-                    if date_filter.get("start_date") and isinstance(date_filter["start_date"], str):
-                        try:
-                            date_filter["start_date"] = datetime.strptime(
-                                date_filter["start_date"], "%Y-%m-%d"
-                            ).date()
-                        except (ValueError, TypeError) as e:
-                            print(f"Error parsing date_filter start_date: {e}")
-                            date_filter["start_date"] = None
-                    
-                    if date_filter.get("end_date") and isinstance(date_filter["end_date"], str):
-                        try:
-                            date_filter["end_date"] = datetime.strptime(
-                                date_filter["end_date"], "%Y-%m-%d"
-                            ).date()
-                        except (ValueError, TypeError) as e:
-                            print(f"Error parsing date_filter end_date: {e}")
-                            date_filter["end_date"] = None
-                
-                # Convert leave_type string to enum with error handling
-                if parsed.get("leave_type"):
-                    try:
-                        if isinstance(parsed["leave_type"], str):
-                            parsed["leave_type"] = LeaveType[parsed["leave_type"].upper()]
-                    except (KeyError, AttributeError) as e:
-                        print(f"Error converting leave_type: {e}")
-                        parsed["leave_type"] = None
-                
-                # Auto-populate employee_name for employees querying their own data
-                current_intent = parsed.get("intent")
-                if current_intent in ["QUERY_LEAVES", "CHECK_BALANCE"] and not parsed.get("employee_name"):
-                    if not user_context["is_manager"] or parsed.get("status") == "PENDING":
-                        parsed["employee_name"] = user_context["full_name"]
-                
-                # Validate completeness for leave requests
-                if current_intent == "REQUEST_LEAVE":
-                    parsed = self._check_leave_completeness(parsed)
-                
-                # Add role-appropriate suggested actions
-                if not parsed.get("suggested_actions"):
-                    parsed["suggested_actions"] = self._get_role_suggested_actions(
-                        user_context, 
-                        current_intent or "GENERAL"
-                    )
-                
-                # Ensure intent is always set and valid
-                if not parsed.get("intent"):
-                    parsed["intent"] = "GENERAL"
-                
-                # Validate intent is one of the expected values
-                valid_intents = ["REQUEST_LEAVE", "APPROVE_REJECT", "QUERY_LEAVES", 
-                               "CHECK_BALANCE", "TEAM_STATUS", "ANALYTICS", "QUERY_POLICY", "GENERAL"]
-                if parsed["intent"] not in valid_intents:
-                    print(f"Invalid intent detected: {parsed['intent']}, defaulting to GENERAL")
-                    parsed["intent"] = "GENERAL"
-                    
-                return parsed
+                        parsed["date_filter"][date_field] = datetime.strptime(
+                            date_val, "%Y-%m-%d"
+                        ).date()
+                    except:
+                        parsed["date_filter"][date_field] = None
+        
+        # Convert leave_type to enum
+        if parsed.get("leave_type") and isinstance(parsed["leave_type"], str):
+            try:
+                parsed["leave_type"] = LeaveType[parsed["leave_type"].upper()]
+            except KeyError:
+                parsed["leave_type"] = None
+        
+        # Auto-populate employee_name for non-managers
+        intent = parsed.get("intent")
+        if intent in ["QUERY_LEAVES", "CHECK_BALANCE"] and not parsed.get("employee_name"):
+            if not user_context["is_manager"] or parsed.get("status") == "PENDING":
+                parsed["employee_name"] = user_context["full_name"]
+        
+        # Determine UI state
+        if not parsed.get("ui_state"):
+            parsed["ui_state"] = self._determine_ui_state(
+                parsed, intent, text.lower(), is_first_message
+            )
+        
+        # Check completeness for leave requests
+        if intent == "REQUEST_LEAVE":
+            parsed = self._check_leave_completeness(parsed)
+        
+        # Add suggested actions
+        if not parsed.get("suggested_actions"):
+            parsed["suggested_actions"] = self._get_role_suggested_actions(
+                user_context, intent or "GENERAL"
+            )
+        
+        # Validate intent
+        valid_intents = ["REQUEST_LEAVE", "APPROVE_REJECT", "QUERY_LEAVES", 
+                        "CHECK_BALANCE", "TEAM_STATUS", "ANALYTICS", "QUERY_POLICY", "GENERAL"]
+        if not parsed.get("intent") or parsed["intent"] not in valid_intents:
+            parsed["intent"] = "GENERAL"
+        
+        return parsed
+
+    def _determine_ui_state(self, parsed: Dict, intent: str, text_lower: str, is_first_message: bool) -> Dict:
+        """Determine which UI component to show based on conversation state"""
+        
+        # Handle greeting/initial message
+        if is_first_message or intent == "GENERAL":
+            return {
+                "component": "GREETING",
+                "stage": "GREETING",
+                "awaiting_input": None,
+                "show_calendar": False,
+                "show_type_options": False,
+                "show_quick_actions": True,
+                "collected_data": {}
+            }
+        
+        # Handle leave request flow
+        if intent == "REQUEST_LEAVE":
+            collected = {
+                "leave_type": parsed.get("leave_type").value if parsed.get("leave_type") else None,
+                "start_date": parsed.get("start_date").isoformat() if parsed.get("start_date") else None,
+                "end_date": parsed.get("end_date").isoformat() if parsed.get("end_date") else None,
+                "reason": parsed.get("reason")
+            }
+            
+            # Remove None values
+            collected = {k: v for k, v in collected.items() if v is not None}
+            
+            # Determine stage based on what's missing
+            if not parsed.get("leave_type"):
+                return {
+                    "component": "TYPE_SELECTOR",
+                    "stage": "TYPE_SELECTION",
+                    "awaiting_input": "leave_type",
+                    "show_calendar": False,
+                    "show_type_options": True,
+                    "show_quick_actions": False,
+                    "collected_data": collected
+                }
+            
+            elif not parsed.get("start_date") or not parsed.get("end_date"):
+                return {
+                    "component": "DATE_PICKER",
+                    "stage": "DATE_SELECTION",
+                    "awaiting_input": "dates",
+                    "show_calendar": True,
+                    "show_type_options": False,
+                    "show_quick_actions": False,
+                    "collected_data": collected
+                }
+            
+            elif parsed.get("is_complete") and not parsed.get("responsible_person"):
+                return {
+                    "component": "PERSON_SELECTOR",
+                    "stage": "RESPONSIBLE_PERSON",
+                    "awaiting_input": "responsible_person",
+                    "show_calendar": False,
+                    "show_type_options": False,
+                    "show_quick_actions": False,
+                    "collected_data": collected
+                }
+            
+            elif parsed.get("is_complete"):
+                return {
+                    "component": "CONFIRMATION_CARD",
+                    "stage": "CONFIRMATION",
+                    "awaiting_input": "confirmation",
+                    "show_calendar": False,
+                    "show_type_options": False,
+                    "show_quick_actions": False,
+                    "collected_data": collected
+                }
             
             else:
-                print(f"Groq API Error: {response.status_code} - {response.text}")
-                return self._fallback_parse(text, user_context)
-                
-        except requests.exceptions.Timeout:
-            print("Groq API timeout, using fallback parser")
-            return self._fallback_parse(text, user_context)
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Groq API request failed: {e}")
-            return self._fallback_parse(text, user_context)
-            
-        except KeyError as e:
-            print(f"Key error in API response: {e}")
-            return self._fallback_parse(text, user_context)
-            
-        except Exception as e:
-            print(f"Unexpected error in parse_conversation: {e}")
-            return self._fallback_parse(text, user_context)
+                # Need more info
+                return {
+                    "component": "TEXT_INPUT",
+                    "stage": "REASON_INPUT",
+                    "awaiting_input": "reason",
+                    "show_calendar": False,
+                    "show_type_options": False,
+                    "show_quick_actions": False,
+                    "collected_data": collected
+                }
+        
+        # Handle query leaves
+        elif intent == "QUERY_LEAVES":
+            return {
+                "component": "LEAVE_LIST",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_filters": True,
+                "show_status_badges": True,
+                "collected_data": {}
+            }
+        
+        # Handle balance check
+        elif intent == "CHECK_BALANCE":
+            return {
+                "component": "BALANCE_CARD",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_breakdown": True,
+                "collected_data": {}
+            }
+        
+        # Handle policy query
+        elif intent == "QUERY_POLICY":
+            return {
+                "component": "POLICY_CARD",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_references": True,
+                "collected_data": {"policy_type": parsed.get("policy_type")}
+            }
+        
+        # Handle approval/rejection
+        elif intent == "APPROVE_REJECT":
+            if parsed.get("action") == "CHECK_PENDING":
+                return {
+                    "component": "LEAVE_LIST",
+                    "stage": "VIEWING",
+                    "awaiting_input": None,
+                    "show_filters": True,
+                    "show_status_badges": True,
+                    "show_action_buttons": True,
+                    "collected_data": {"filter": "PENDING"}
+                }
+            else:
+                return {
+                    "component": "STATUS_CARD",
+                    "stage": "COMPLETED",
+                    "awaiting_input": None,
+                    "show_success": parsed.get("action") == "APPROVE",
+                    "collected_data": {}
+                }
+        
+        # Handle team status
+        elif intent == "TEAM_STATUS":
+            return {
+                "component": "TEAM_STATUS_CARD",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_availability": True,
+                "collected_data": {}
+            }
+        
+        # Default fallback
+        return {
+            "component": "TEXT_INPUT",
+            "stage": "GENERAL",
+            "awaiting_input": None,
+            "show_calendar": False,
+            "show_type_options": False,
+            "show_quick_actions": True,
+            "collected_data": {}
+        }
 
     def _get_role_suggested_actions(self, user_context: Dict, intent: str) -> List[str]:
         """Get role-appropriate suggested actions"""
@@ -362,7 +478,7 @@ Respond ONLY with valid JSON:
                 return ["Pending approvals", "Team status", "View my team"]
     
     def _check_leave_completeness(self, parsed: Dict) -> Dict:
-        """Check if leave request has all required fields"""
+        """Check if leave request has all required fields and update UI state"""
         missing = []
         
         # Check leave_type first
@@ -372,7 +488,24 @@ Respond ONLY with valid JSON:
             parsed["needs_clarification"] = True
             parsed["is_complete"] = False
             parsed["missing_fields"] = missing
+            parsed["ui_state"] = {
+                "component": "TYPE_SELECTOR",
+                "stage": "TYPE_SELECTION",
+                "awaiting_input": "leave_type",
+                "show_calendar": False,
+                "show_type_options": True,
+                "show_quick_actions": False,
+                "collected_data": {}
+            }
             return parsed  # Return early - don't check other fields yet
+        
+        # Collect data so far
+        collected_data = {
+            "leave_type": parsed.get("leave_type").value if parsed.get("leave_type") else None,
+            "start_date": parsed.get("start_date").isoformat() if parsed.get("start_date") else None,
+            "end_date": parsed.get("end_date").isoformat() if parsed.get("end_date") else None,
+            "reason": parsed.get("reason")
+        }
         
         # Only check dates if leave_type exists
         if not parsed.get("start_date"):
@@ -380,6 +513,15 @@ Respond ONLY with valid JSON:
             parsed["clarification_question"] = "When would you like to start your leave?"
             parsed["needs_clarification"] = True
             parsed["is_complete"] = False
+            parsed["ui_state"] = {
+                "component": "DATE_PICKER",
+                "stage": "DATE_SELECTION",
+                "awaiting_input": "dates",
+                "show_calendar": True,
+                "show_type_options": False,
+                "show_quick_actions": False,
+                "collected_data": {k: v for k, v in collected_data.items() if v is not None}
+            }
         elif not parsed.get("end_date"):
             # Auto-set end_date to start_date for single day (this is fine)
             parsed["end_date"] = parsed["start_date"]
@@ -390,6 +532,15 @@ Respond ONLY with valid JSON:
         if parsed.get("leave_type") and parsed.get("start_date") and parsed.get("end_date"):
             parsed["is_complete"] = True
             parsed["needs_clarification"] = False
+            parsed["ui_state"] = {
+                "component": "CONFIRMATION_CARD",
+                "stage": "CONFIRMATION",
+                "awaiting_input": "confirmation",
+                "show_calendar": False,
+                "show_type_options": False,
+                "show_quick_actions": False,
+                "collected_data": {k: v for k, v in collected_data.items() if v is not None}
+            }
         else:
             parsed["is_complete"] = False
             parsed["needs_clarification"] = True
@@ -397,8 +548,11 @@ Respond ONLY with valid JSON:
         return parsed
     
     def _fallback_parse(self, text: str, user_context: Dict) -> Dict:
-        """Enhanced rule-based fallback parser with policy query support"""
+        """Enhanced rule-based fallback parser with policy query support and UI state"""
         text_lower = text.lower().strip()
+        
+        # Detect if first message
+        is_greeting = any(word in text_lower for word in ["hi", "hello", "hey", "welcome", "start"])
         
         # Default result structure
         result = {
@@ -416,10 +570,19 @@ Respond ONLY with valid JSON:
             "date_filter": None,
             "employee_name": user_context["full_name"] if not user_context["is_manager"] else None,
             "action": None,
-            "suggested_actions": self._get_role_suggested_actions(user_context, "GENERAL")
+            "suggested_actions": self._get_role_suggested_actions(user_context, "GENERAL"),
+            "ui_state": {
+                "component": "GREETING" if is_greeting else "TEXT_INPUT",
+                "stage": "GREETING" if is_greeting else "GENERAL",
+                "awaiting_input": None,
+                "show_calendar": False,
+                "show_type_options": False,
+                "show_quick_actions": True,
+                "collected_data": {}
+            }
         }
         
-        # NEW: Check for policy queries
+        # Check for policy queries
         policy_keywords = ["policy", "rule", "guideline", "requirement", "how many", 
                           "allowed", "notice period", "blackout", "documentation"]
         
@@ -444,6 +607,13 @@ Respond ONLY with valid JSON:
                     result["policy_type"] = "LEAVE"
                 
                 result["suggested_actions"] = ["Request leave", "Check balance", "View my leaves"]
+                result["ui_state"] = {
+                    "component": "POLICY_CARD",
+                    "stage": "VIEWING",
+                    "awaiting_input": None,
+                    "show_references": True,
+                    "collected_data": {"policy_type": result["policy_type"]}
+                }
                 return result
         
         # Intent: "Who is on leave today?"
@@ -459,6 +629,15 @@ Respond ONLY with valid JSON:
             elif "tomorrow" in text_lower:
                 tomorrow = datetime.now().date() + timedelta(days=1)
                 result["date_filter"] = {"type": "SPECIFIC_DATE", "date": tomorrow.isoformat()}
+            
+            result["ui_state"] = {
+                "component": "LEAVE_LIST",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_filters": True,
+                "show_status_badges": True,
+                "collected_data": {}
+            }
         
         # Intent: Pending approvals
         elif any(word in text_lower for word in ["pending", "approval", "approve", "need approval", "awaiting"]):
@@ -466,11 +645,28 @@ Respond ONLY with valid JSON:
                 result["intent"] = "APPROVE_REJECT"
                 result["action"] = "CHECK_PENDING"
                 result["suggested_actions"] = ["View pending approvals", "Approve leaves", "Check team status"]
+                result["ui_state"] = {
+                    "component": "LEAVE_LIST",
+                    "stage": "VIEWING",
+                    "awaiting_input": None,
+                    "show_filters": True,
+                    "show_status_badges": True,
+                    "show_action_buttons": True,
+                    "collected_data": {"filter": "PENDING"}
+                }
             else:
                 result["intent"] = "QUERY_LEAVES"
                 result["status"] = "PENDING"
                 result["employee_name"] = user_context["full_name"]
                 result["suggested_actions"] = ["Check my leaves", "View balance", "Request leave"]
+                result["ui_state"] = {
+                    "component": "LEAVE_LIST",
+                    "stage": "VIEWING",
+                    "awaiting_input": None,
+                    "show_filters": True,
+                    "show_status_badges": True,
+                    "collected_data": {}
+                }
         
         # Intent: Leave requests
         elif any(word in text_lower for word in ["request leave", "apply for leave", "take leave", "need leave"]):
@@ -485,16 +681,52 @@ Respond ONLY with valid JSON:
                 result["leave_type"] = LeaveType.CASUAL
             elif "annual" in text_lower or "vacation" in text_lower:
                 result["leave_type"] = LeaveType.ANNUAL
+            
+            # Set UI state
+            if result["leave_type"]:
+                result["ui_state"] = {
+                    "component": "DATE_PICKER",
+                    "stage": "DATE_SELECTION",
+                    "awaiting_input": "dates",
+                    "show_calendar": True,
+                    "show_type_options": False,
+                    "show_quick_actions": False,
+                    "collected_data": {"leave_type": result["leave_type"].value}
+                }
+            else:
+                result["ui_state"] = {
+                    "component": "TYPE_SELECTOR",
+                    "stage": "TYPE_SELECTION",
+                    "awaiting_input": "leave_type",
+                    "show_calendar": False,
+                    "show_type_options": True,
+                    "show_quick_actions": False,
+                    "collected_data": {}
+                }
         
         # Intent: Balance check
         elif any(word in text_lower for word in ["balance", "available days", "leave days"]):
             result["intent"] = "CHECK_BALANCE"
             result["suggested_actions"] = ["Request leave", "View my leaves"]
+            result["ui_state"] = {
+                "component": "BALANCE_CARD",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_breakdown": True,
+                "collected_data": {}
+            }
         
         # Intent: Team status (managers only)
         elif any(word in text_lower for word in ["team status", "team availability", "my team"]) and user_context["is_manager"]:
             result["intent"] = "TEAM_STATUS"
             result["suggested_actions"] = ["Pending approvals", "View analytics", "Check balances"]
+            result["ui_state"] = {
+                "component": "TEAM_STATUS_CARD",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_availability": True,
+                "collected_data": {}
+            }
         
         # Intent: General leave queries
         elif any(word in text_lower for word in ["show leaves", "leave list", "leaves", "leave history"]):
@@ -503,6 +735,15 @@ Respond ONLY with valid JSON:
             
             if "my" in text_lower and not user_context["is_manager"]:
                 result["employee_name"] = user_context["full_name"]
+            
+            result["ui_state"] = {
+                "component": "LEAVE_LIST",
+                "stage": "VIEWING",
+                "awaiting_input": None,
+                "show_filters": True,
+                "show_status_badges": True,
+                "collected_data": {}
+            }
         
         return result
     
@@ -520,70 +761,33 @@ Respond ONLY with valid JSON:
         has_violations = policy_compliance and not policy_compliance.get("compliant")
         has_warnings = policy_compliance and policy_compliance.get("warnings")
         
-        system_prompt = f"""You are a helpful leave management assistant with policy enforcement capabilities.
-
-User: {user_context['full_name']} ({user_context['role']} - {user_context['position']})
-
-Generate natural, conversational responses.
+        # OPTIMIZED: Much shorter prompt
+        system_prompt = f"""Leave assistant for {user_context['full_name']} ({user_context['role']}).
 
 INTENT: {intent}
+Policy violations: {has_violations}
 
-POLICY COMPLIANCE STATUS:
-- Has Violations: {has_violations}
-- Has Warnings: {has_warnings}
+Be friendly, clear, and actionable. 2-3 sentences for simple queries."""
 
-TONE GUIDELINES:
-- Friendly and professional
-- Clear and actionable
-- When policy violations exist: Be firm but empathetic, explain the policy clearly
-- When warnings exist: Inform user but don't block the action
-- For QUERY_POLICY: Summarize policy information clearly, cite specific rules
-- Adapt to the situation:
-  * REQUEST_LEAVE: Check policy compliance first, guide user to comply
-  * APPROVE_REJECT: Enforce policy violations strictly
-  * QUERY_POLICY: Explain policies clearly and concisely
-  * Other intents: Standard helpful tone
+        # Simplified user prompt
+        user_prompt = f"""Parsed: {json.dumps(parsed, default=str)[:500]}
+Data: {json.dumps(data, default=str)[:500]}
 
-Keep responses 2-3 sentences for simple queries, longer for complex data or policy explanations."""
-
-        user_prompt = f"""
-PARSED DATA:
-{json.dumps(parsed, indent=2, default=str)}
-
-RESULT DATA:
-{json.dumps(data, indent=2, default=str)}
-
-Generate a helpful response that:
-1. Addresses the user's request
-2. Clearly explains any policy violations or warnings
-3. Guides user on next steps
-4. Maintains professional but friendly tone"""
+Generate helpful response addressing the request and any policy issues."""
 
         try:
-            response = requests.post(
-                self.api_url,
-                headers={
-                    "Authorization": f"Bearer {self.groq_api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "temperature": 0.7,
-                    "max_tokens": 300
-                },
-                timeout=8
+            result = self._make_groq_request(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.7,
+                max_tokens=250  # Reduced
             )
             
-            if response.status_code == 200:
-                result = response.json()
-                ai_response = result["choices"][0]["message"]["content"]
-                return ai_response.strip()
+            if result:
+                return result["choices"][0]["message"]["content"].strip()
             else:
-                print(f"Groq API response error: {response.status_code}")
                 return self._generate_fallback_response_with_policy(
                     intent, parsed, data, user_context, policy_compliance
                 )
@@ -610,7 +814,7 @@ Generate a helpful response that:
             warnings = policy_compliance.get("warnings", [])
             
             if violations and intent in ["REQUEST_LEAVE", "APPROVE_REJECT"]:
-                response = "Policy Violation Detected\n\n"
+                response = "⚠️ Policy Violation Detected\n\n"
                 response += "Your request cannot be processed due to the following policy violations:\n\n"
                 for i, violation in enumerate(violations, 1):
                     response += f"{i}. {violation}\n"
@@ -618,7 +822,7 @@ Generate a helpful response that:
                 # Show relevant policies
                 relevant = policy_compliance.get("relevant_policies", [])
                 if relevant:
-                    response += "\nRelevant Policy:\n"
+                    response += "\n📋 Relevant Policy:\n"
                     response += f"- {relevant[0]['section_title']}\n"
                     response += f"  {relevant[0]['content'][:200]}...\n"
                 
@@ -626,7 +830,7 @@ Generate a helpful response that:
                 return response
             
             if warnings:
-                warning_text = "\n\nNote: " + "; ".join(warnings)
+                warning_text = "\n\n⚠️ Note: " + "; ".join(warnings)
             else:
                 warning_text = ""
         else:
@@ -655,18 +859,18 @@ Generate a helpful response that:
                 duration = (leave_data.get("end_date") - leave_data.get("start_date")).days + 1 if leave_data.get("end_date") and leave_data.get("start_date") else 1
                 leave_type = leave_data.get("leave_type")
                 
-                response = f"Your {leave_type.value.lower() if leave_type else 'leave'} request for {duration} day(s) "
+                response = f"✅ Your {leave_type.value.lower() if leave_type else 'leave'} request for {duration} day(s) "
                 response += f"from {leave_data.get('start_date')} to {leave_data.get('end_date')}.\n\n"
                 
                 # Add balance info
                 balance = data.get("leave_balance")
                 if balance:
-                    response += f"Your balance: {balance['available']}/{balance['total']} days available.\n\n"
+                    response += f"📊 Your balance: {balance['available']}/{balance['total']} days available.\n\n"
                 
                 # Add responsible person suggestions
                 suggested = data.get("suggested_responsible_persons", [])
                 if suggested:
-                    response += "Suggested colleagues to handle your responsibilities:\n"
+                    response += "👥 Suggested colleagues to handle your responsibilities:\n"
                     for i, person in enumerate(suggested[:3], 1):
                         response += f"{i}. {person['name']} ({person['position']}) - {person['reason']}\n"
                     response += "\nReply with a number to select, or 'submit' to proceed without assignment."
@@ -676,7 +880,7 @@ Generate a helpful response that:
                 # Add impact warning
                 impact = data.get("team_impact", {})
                 if impact.get("level") in ["MEDIUM", "HIGH"]:
-                    response += f"\n\nNote: {', '.join(impact.get('factors', []))}"
+                    response += f"\n\n⚠️ Note: {', '.join(impact.get('factors', []))}"
                 
                 return response
             
@@ -686,7 +890,8 @@ Generate a helpful response that:
             if data.get("success"):
                 action = data.get("action", "processed")
                 leave_info = data.get("leave", {})
-                return f"Successfully {action} leave request for {leave_info.get('employee')} ({leave_info.get('dates')})."
+                emoji = "✅" if action == "approved" else "❌"
+                return f"{emoji} Successfully {action} leave request for {leave_info.get('employee')} ({leave_info.get('dates')})."
             else:
                 return data.get("message", "Unable to process the approval/rejection.")
         
@@ -696,10 +901,11 @@ Generate a helpful response that:
                 return "No leaves found matching your criteria."
             
             leaves = data.get("leaves", [])
-            response = f"Found {count} leave record(s):\n\n"
+            response = f"📋 Found {count} leave record(s):\n\n"
             
             for leave in leaves[:5]:  # Show first 5
-                response += f"- {leave['employee_name']} ({leave['department']}): "
+                status_emoji = {"PENDING": "⏳", "APPROVED": "✅", "REJECTED": "❌"}.get(leave['status'], "•")
+                response += f"{status_emoji} {leave['employee_name']} ({leave['department']}): "
                 response += f"{leave['leave_type']} from {leave['start_date']} to {leave['end_date']} "
                 response += f"[{leave['status']}]\n"
             
@@ -715,15 +921,15 @@ Generate a helpful response that:
             
             if len(balances) == 1 and balances[0]["employee_name"] == user_context["full_name"]:
                 # User checking their own balance
-                response = "Your leave balance:\n\n"
+                response = "📊 Your leave balance:\n\n"
                 for bal in balances:
-                    response += f"{bal['leave_type']}: {bal['available']}/{bal['total']} days available "
+                    response += f"• {bal['leave_type']}: {bal['available']}/{bal['total']} days available "
                     response += f"({bal['used']} used)\n"
             else:
                 # Manager/HR checking team balances
-                response = f"Leave balances for {data.get('count')} employee(s):\n\n"
+                response = f"📊 Leave balances for {data.get('count')} employee(s):\n\n"
                 for bal in balances[:10]:
-                    response += f"- {bal['employee_name']}: {bal['leave_type']} - "
+                    response += f"• {bal['employee_name']}: {bal['leave_type']} - "
                     response += f"{bal['available']}/{bal['total']} available\n"
             
             return response
@@ -733,7 +939,7 @@ Generate a helpful response that:
             on_leave = data.get("on_leave", 0)
             available = data.get("available", 0)
             
-            response = f"Team Status: {available}/{total} available, {on_leave} on leave\n\n"
+            response = f"👥 Team Status: {available}/{total} available, {on_leave} on leave\n\n"
             
             team_status = data.get("team_status", [])
             on_leave_list = [t for t in team_status if t["status"] == "On Leave"]
@@ -741,14 +947,14 @@ Generate a helpful response that:
             if on_leave_list:
                 response += "Currently on leave:\n"
                 for member in on_leave_list[:5]:
-                    response += f"- {member['employee_name']} ({member['position']}) - {member.get('leave_type', 'N/A')}\n"
+                    response += f"• {member['employee_name']} ({member['position']}) - {member.get('leave_type', 'N/A')}\n"
             else:
-                response += "Everyone is available."
+                response += "✅ Everyone is available."
             
             return response
         
         elif intent == "ANALYTICS":
-            response = "Analytics Overview:\n\n"
+            response = "📊 Analytics Overview:\n\n"
             
             monthly = data.get("monthly_distribution", [])
             if monthly:
@@ -764,14 +970,14 @@ Generate a helpful response that:
             policies = data.get("policies", [])
             
             if not policies:
-                return data.get("message", "I couldn't find specific policy information. Please contact HR.")
+                return data.get("message", "I couldn't find specific policy information. Please contact HR for clarification.")
             
-            response = f"Here's what I found about your question:\n\n"
+            response = f"📋 Here's what I found about your question:\n\n"
             
             for i, policy in enumerate(policies[:2], 1):  # Show top 2
-                response += f"Policy: {policy['section_title']}\n"
+                response += f"**{policy['section_title']}**\n"
                 response += f"{policy['content'][:300]}...\n"
-                response += f"(From: {policy['policy_name']} - {policy['relevance']} relevant)\n\n"
+                response += f"_(From: {policy['policy_name']} - {policy['relevance']} relevant)_\n\n"
             
             if len(policies) > 2:
                 response += f"... and {len(policies) - 2} more relevant sections found.\n\n"
@@ -780,7 +986,7 @@ Generate a helpful response that:
             return response
         
         else:
-            return "How can I help you with leave management today? You can request leave, check balances, view team status, ask about policies, or ask me anything related to leaves."
+            return "👋 How can I help you with leave management today? You can request leave, check balances, view team status, ask about policies, or ask me anything related to leaves."
     
     def calculate_impact_score(self, leave_data: Dict, team_data: List) -> Dict:
         """Calculate team impact score for a leave request"""

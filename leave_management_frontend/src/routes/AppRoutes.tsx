@@ -6,7 +6,7 @@ import ProtectedRoute from '../components/auth/ProtectedRoute';
 import RoleBasedLayout from '../components/layout/RoleBasedLayout';
 
 // Employee Pages
-import DashboardPage from '../pages/employee/DashboardPage';
+import ChatDashboard from '../pages/employee/ChatDashboard';
 import MyLeavesPage from '../pages/employee/MyLeavesPage';
 import LeaveBalancePage from '../pages/employee/LeaveBalancePage';
 
@@ -27,7 +27,7 @@ const AppRoutes = () => {
       
       <Route path="/" element={<ProtectedRoute><RoleBasedLayout /></ProtectedRoute>}>
         {/* Common routes - all have access to chat on dashboard */}
-        <Route path="dashboard" element={<DashboardPage />} />
+        <Route path="dashboard" element={<ChatDashboard />} />
         <Route path="my-leaves" element={<MyLeavesPage />} />
         <Route path="leave-balance" element={<LeaveBalancePage />} />
         
