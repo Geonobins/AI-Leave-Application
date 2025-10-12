@@ -46,7 +46,7 @@ def retry_with_backoff(max_retries=3, base_delay=2):
 
 
 class UnifiedAIService:
-    """Unified AI Service with enhanced error handling and rate limit management"""
+    """Unified AI Service with enhanced error handling, rate limit management, and context preservation"""
     
     def __init__(self):
         self.groq_api_key = settings.GROQ_API_KEY
@@ -106,14 +106,24 @@ class UnifiedAIService:
         chat_history: List[Dict],
         user_context: Dict
     ) -> Dict:
-        """Parse leave management conversation with optimized prompts"""
+        """Parse leave management conversation with context preservation"""
         
         today = datetime.now().date()
+        
+        # Extract previously collected data from chat history
+        previous_data = self._extract_previous_context(chat_history)
         
         # OPTIMIZED: Condensed system prompt to reduce token usage
         system_prompt = f"""AI assistant for leave management. Today: {today.strftime('%Y-%m-%d')}
 
 USER: {user_context['role']} - {user_context['full_name']} (Manager: {user_context['is_manager']}, HR: {user_context['is_hr']})
+
+PREVIOUSLY COLLECTED: {json.dumps(previous_data, default=str) if previous_data else "None"}
+CRITICAL: If user provides NEW information, MERGE with previously collected data. Don't lose context!
+
+Example flow:
+- User: "I need leave next Monday" → Collect: start_date=next_monday
+- User: "sick leave" → MERGE: leave_type=SICK + start_date=next_monday (preserved!)
 
 INTENTS:
 1. REQUEST_LEAVE - Request leave (requires: leave_type, start_date, end_date)
@@ -132,16 +142,21 @@ ROLE RULES:
 
 LEAVE TYPES: SICK, CASUAL, ANNUAL, MATERNITY, PATERNITY, UNPAID
 
-CRITICAL:
+CRITICAL PARSING RULES:
 - NEVER assume leave_type - must be explicit
-- For REQUEST_LEAVE: needs_clarification=true if ANY required field missing
+- For REQUEST_LEAVE: needs_clarification=true if ANY required field missing AFTER merging with previous context
 - Employees: "pending" means THEIR pending leaves
 - Managers: "pending" means leaves AWAITING approval
+- PRESERVE previously collected data - only ask for what's still missing!
 
 DATE PARSING:
 - "tomorrow" = {(today + timedelta(days=1)).strftime('%Y-%m-%d')}
 - "today" = {today.strftime('%Y-%m-%d')}
-- "next Monday" = calculate next Monday
+- "next Monday" = {self._get_next_weekday(0).strftime('%Y-%m-%d')}
+- "next Tuesday" = {self._get_next_weekday(1).strftime('%Y-%m-%d')}
+- "next Wednesday" = {self._get_next_weekday(2).strftime('%Y-%m-%d')}
+- "next Thursday" = {self._get_next_weekday(3).strftime('%Y-%m-%d')}
+- "next Friday" = {self._get_next_weekday(4).strftime('%Y-%m-%d')}
 - "this week" = THIS_WEEK filter
 
 Response JSON:
@@ -197,7 +212,9 @@ Response JSON:
             
             if not result:
                 print("No response from Groq API, using fallback")
-                return self._fallback_parse(text, user_context)
+                # Merge with previous context before fallback
+                fallback_result = self._fallback_parse(text, user_context)
+                return self._merge_with_previous_context(fallback_result, previous_data)
             
             content = result["choices"][0]["message"]["content"]
             
@@ -205,10 +222,15 @@ Response JSON:
                 parsed = json.loads(content) if isinstance(content, str) else content
             except json.JSONDecodeError as e:
                 print(f"JSON parsing failed: {e}")
-                return self._fallback_parse(text, user_context)
+                fallback_result = self._fallback_parse(text, user_context)
+                return self._merge_with_previous_context(fallback_result, previous_data)
             
             if not isinstance(parsed, dict):
-                return self._fallback_parse(text, user_context)
+                fallback_result = self._fallback_parse(text, user_context)
+                return self._merge_with_previous_context(fallback_result, previous_data)
+            
+            # Merge with previously collected data
+            parsed = self._merge_with_previous_context(parsed, previous_data)
             
             # Process dates and leave types
             parsed = self._process_parsed_data(parsed, user_context, is_first_message, text)
@@ -217,7 +239,96 @@ Response JSON:
                 
         except Exception as e:
             print(f"Parse conversation error: {e}")
-            return self._fallback_parse(text, user_context)
+            fallback_result = self._fallback_parse(text, user_context)
+            # Extract previous context even in error case
+            previous_data = self._extract_previous_context(chat_history)
+            return self._merge_with_previous_context(fallback_result, previous_data)
+    
+    def _get_next_weekday(self, target_day: int) -> date:
+        """Get the date of next occurrence of weekday (0=Monday, 6=Sunday)"""
+        today = datetime.now().date()
+        days_ahead = target_day - today.weekday()
+        if days_ahead <= 0:  # Target day already happened this week
+            days_ahead += 7
+        return today + timedelta(days=days_ahead)
+    
+    def _extract_previous_context(self, chat_history: List[Dict]) -> Dict:
+        """Extract previously collected data from chat history"""
+        previous_data = {}
+        
+        # Look through recent assistant messages for collected data
+        for msg in reversed(chat_history[-5:]):  # Check last 5 messages
+            if msg.get("role") == "assistant" and msg.get("data"):
+                leave_data = msg["data"].get("leave_data", {})
+                
+                # Extract fields that were previously collected
+                if leave_data.get("leave_type") and not previous_data.get("leave_type"):
+                    leave_type = leave_data["leave_type"]
+                    # Handle both string and enum
+                    if isinstance(leave_type, str):
+                        previous_data["leave_type"] = leave_type
+                    else:
+                        previous_data["leave_type"] = leave_type
+                
+                if leave_data.get("start_date") and not previous_data.get("start_date"):
+                    previous_data["start_date"] = leave_data["start_date"]
+                
+                if leave_data.get("end_date") and not previous_data.get("end_date"):
+                    previous_data["end_date"] = leave_data["end_date"]
+                
+                if leave_data.get("reason") and not previous_data.get("reason"):
+                    previous_data["reason"] = leave_data["reason"]
+                
+                if leave_data.get("responsible_person") and not previous_data.get("responsible_person"):
+                    previous_data["responsible_person"] = leave_data["responsible_person"]
+        
+        return previous_data
+    
+    def _merge_with_previous_context(self, parsed: Dict, previous_data: Dict) -> Dict:
+        """Merge newly parsed data with previously collected context"""
+        if not previous_data:
+            return parsed
+        
+        # Only merge if we're still in REQUEST_LEAVE flow
+        if parsed.get("intent") != "REQUEST_LEAVE":
+            return parsed
+        
+        # Merge fields: new data takes precedence, but use previous if new is missing
+        if not parsed.get("leave_type") and previous_data.get("leave_type"):
+            parsed["leave_type"] = previous_data["leave_type"]
+            print(f"✓ Restored leave_type from context: {previous_data['leave_type']}")
+        
+        if not parsed.get("start_date") and previous_data.get("start_date"):
+            # Handle both string and date objects
+            if isinstance(previous_data["start_date"], str):
+                try:
+                    parsed["start_date"] = datetime.strptime(previous_data["start_date"], "%Y-%m-%d").date()
+                except:
+                    parsed["start_date"] = previous_data["start_date"]
+            else:
+                parsed["start_date"] = previous_data["start_date"]
+            print(f"✓ Restored start_date from context: {parsed['start_date']}")
+        
+        if not parsed.get("end_date") and previous_data.get("end_date"):
+            # Handle both string and date objects
+            if isinstance(previous_data["end_date"], str):
+                try:
+                    parsed["end_date"] = datetime.strptime(previous_data["end_date"], "%Y-%m-%d").date()
+                except:
+                    parsed["end_date"] = previous_data["end_date"]
+            else:
+                parsed["end_date"] = previous_data["end_date"]
+            print(f"✓ Restored end_date from context: {parsed['end_date']}")
+        
+        if not parsed.get("reason") and previous_data.get("reason"):
+            parsed["reason"] = previous_data["reason"]
+            print(f"✓ Restored reason from context")
+        
+        if not parsed.get("responsible_person") and previous_data.get("responsible_person"):
+            parsed["responsible_person"] = previous_data["responsible_person"]
+            print(f"✓ Restored responsible_person from context")
+        
+        return parsed
     
     def _process_parsed_data(self, parsed: Dict, user_context: Dict, 
                             is_first_message: bool, text: str) -> Dict:
@@ -682,18 +793,59 @@ Response JSON:
             elif "annual" in text_lower or "vacation" in text_lower:
                 result["leave_type"] = LeaveType.ANNUAL
             
+            # Try to extract dates
+            if "tomorrow" in text_lower:
+                result["start_date"] = datetime.now().date() + timedelta(days=1)
+                result["end_date"] = result["start_date"]
+            elif "today" in text_lower:
+                result["start_date"] = datetime.now().date()
+                result["end_date"] = result["start_date"]
+            elif "next monday" in text_lower:
+                result["start_date"] = self._get_next_weekday(0)
+                result["end_date"] = result["start_date"]
+            elif "next tuesday" in text_lower:
+                result["start_date"] = self._get_next_weekday(1)
+                result["end_date"] = result["start_date"]
+            elif "next wednesday" in text_lower:
+                result["start_date"] = self._get_next_weekday(2)
+                result["end_date"] = result["start_date"]
+            elif "next thursday" in text_lower:
+                result["start_date"] = self._get_next_weekday(3)
+                result["end_date"] = result["start_date"]
+            elif "next friday" in text_lower:
+                result["start_date"] = self._get_next_weekday(4)
+                result["end_date"] = result["start_date"]
+            
             # Set UI state
             if result["leave_type"]:
-                result["ui_state"] = {
-                    "component": "DATE_PICKER",
-                    "stage": "DATE_SELECTION",
-                    "awaiting_input": "dates",
-                    "show_calendar": True,
-                    "show_type_options": False,
-                    "show_quick_actions": False,
-                    "collected_data": {"leave_type": result["leave_type"].value}
-                }
+                if result["start_date"]:
+                    # Both type and date collected
+                    result["ui_state"] = {
+                        "component": "CONFIRMATION_CARD",
+                        "stage": "CONFIRMATION",
+                        "awaiting_input": "confirmation",
+                        "show_calendar": False,
+                        "show_type_options": False,
+                        "show_quick_actions": False,
+                        "collected_data": {
+                            "leave_type": result["leave_type"].value,
+                            "start_date": result["start_date"].isoformat(),
+                            "end_date": result["end_date"].isoformat()
+                        }
+                    }
+                else:
+                    # Only type collected, need dates
+                    result["ui_state"] = {
+                        "component": "DATE_PICKER",
+                        "stage": "DATE_SELECTION",
+                        "awaiting_input": "dates",
+                        "show_calendar": True,
+                        "show_type_options": False,
+                        "show_quick_actions": False,
+                        "collected_data": {"leave_type": result["leave_type"].value}
+                    }
             else:
+                # Need type selection
                 result["ui_state"] = {
                     "component": "TYPE_SELECTOR",
                     "stage": "TYPE_SELECTION",
@@ -705,7 +857,7 @@ Response JSON:
                 }
         
         # Intent: Balance check
-        elif any(word in text_lower for word in ["balance", "available days", "leave days"]):
+        elif any(word in text_lower for word in ["balance", "available days", "leave days", "how many days"]):
             result["intent"] = "CHECK_BALANCE"
             result["suggested_actions"] = ["Request leave", "View my leaves"]
             result["ui_state"] = {
@@ -729,7 +881,7 @@ Response JSON:
             }
         
         # Intent: General leave queries
-        elif any(word in text_lower for word in ["show leaves", "leave list", "leaves", "leave history"]):
+        elif any(word in text_lower for word in ["show leaves", "leave list", "my leaves", "leave history"]):
             result["intent"] = "QUERY_LEAVES"
             result["suggested_actions"] = ["Check balance", "Request leave"]
             
@@ -743,6 +895,30 @@ Response JSON:
                 "show_filters": True,
                 "show_status_badges": True,
                 "collected_data": {}
+            }
+        
+        # Handle simple leave type mentions (for context continuation)
+        elif text_lower in ["sick", "sick leave", "casual", "casual leave", "annual", "annual leave", "vacation"]:
+            result["intent"] = "REQUEST_LEAVE"
+            
+            if "sick" in text_lower:
+                result["leave_type"] = LeaveType.SICK
+            elif "casual" in text_lower:
+                result["leave_type"] = LeaveType.CASUAL
+            elif "annual" in text_lower or "vacation" in text_lower:
+                result["leave_type"] = LeaveType.ANNUAL
+            
+            result["needs_clarification"] = True
+            result["missing_fields"] = ["start_date"]
+            result["clarification_question"] = "When would you like to start your leave?"
+            result["ui_state"] = {
+                "component": "DATE_PICKER",
+                "stage": "DATE_SELECTION",
+                "awaiting_input": "dates",
+                "show_calendar": True,
+                "show_type_options": False,
+                "show_quick_actions": False,
+                "collected_data": {"leave_type": result["leave_type"].value if result["leave_type"] else None}
             }
         
         return result

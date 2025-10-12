@@ -470,7 +470,7 @@ const ChatDashboard = () => {
   };
 
   const handleLeaveTypeSelect = (type: string) => {
-    handleSend(`I need ${type.toLowerCase()} leave`);
+    handleSend(` ${type.toLowerCase()} leave`);
   };
 
   const handleDateSelect = (startDate: string, endDate: string) => {
