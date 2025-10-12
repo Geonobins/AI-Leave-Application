@@ -39,7 +39,7 @@ const Navbar = () => {
       <nav className=" h-[80px] backdrop-blur-sm relative">
         <div className="px-4 sm:px-6 py-3 h-full flex items-center justify-between">
           {/* Left Section */}
-          <div className="flex items-center gap-3 sm:gap-4">
+          <div className="flex items-center gap-3 sm:gap-4 w-full">
             <button
               onClick={handleToggleSidebar}
               className="p-2 hover:bg-white/10 rounded-lg transition-colors backdrop-blur-sm:block"
@@ -50,11 +50,15 @@ const Navbar = () => {
 
            
 
-            <h1 className="text-lg sm:text-xl font-bold text-white">Leave AI</h1>
+            <h1 className="text-lg sm:text-xl font-light  text-white flex-1  flex justify-center items-center w-full">
+              <span>
+              alibi.ai
+              </span>
+              </h1>
           </div>
 
           {/* Right Section - Desktop */}
-          <div className="hidden md:flex items-center gap-4">
+          <div className="hidden md:flex items-center gap-4 min-w-fit">
             <div className="flex items-center gap-3 px-4 py-2 bg-white/10 backdrop-blur-sm rounded-full border border-white/20">
               <div className="w-8 h-8 bg-gradient-to-br from-slate-900 to-slate-900 rounded-full flex items-center justify-center">
                 <User className="w-4 h-4 text-white" />
