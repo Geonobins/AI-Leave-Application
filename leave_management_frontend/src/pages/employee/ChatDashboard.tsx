@@ -325,12 +325,12 @@ const PolicyComplianceBadge = ({ compliance }: any) => {
 
   if (compliance.compliant) {
     return (
-      <div className="bg-white/5 backdrop-blur-xl border border-white/20 rounded-2xl p-4 md:p-5 mb-4 shadow-lg">
+      <div className="bg-emerald-950/20 backdrop-blur-xl border border-emerald-900/30 rounded-2xl p-4 md:p-5 mb-4 shadow-lg">
         <div className="flex items-center gap-2 md:gap-3">
-          <div className="p-1.5 md:p-2 bg-white/10 rounded-lg">
-            <CheckCircle className="w-4 h-4 md:w-5 md:h-5 text-white/80" />
+          <div className="p-1.5 md:p-2 bg-emerald-900/20 rounded-lg">
+            <CheckCircle className="w-4 h-4 md:w-5 md:h-5 text-emerald-400/70" />
           </div>
-          <span className="text-xs md:text-sm font-light text-white tracking-wide">Policy Compliant</span>
+          <span className="text-xs md:text-sm font-light text-emerald-300/80 tracking-wide">Policy Compliant</span>
         </div>
       </div>
     );
@@ -339,34 +339,34 @@ const PolicyComplianceBadge = ({ compliance }: any) => {
   if (!compliance.violations?.length) return null;
 
   return (
-    <div className="bg-white/5 backdrop-blur-xl border border-white/20 rounded-2xl mb-4 overflow-hidden shadow-lg">
+    <div className="bg-red-950/20 backdrop-blur-xl border border-red-900/30 rounded-2xl mb-4 overflow-hidden shadow-lg">
       <button
         onClick={() => setShowDetails(!showDetails)}
-        className="w-full flex items-center justify-between gap-2 p-4 md:p-5 hover:bg-white/10 transition-all duration-300"
+        className="w-full flex items-center justify-between gap-2 p-4 md:p-5 hover:bg-red-950/30 transition-all duration-300"
       >
         <div className="flex items-center gap-2 md:gap-3">
-          <div className="p-1.5 md:p-2 bg-white/10 rounded-lg">
-            <AlertCircle className="w-4 h-4 md:w-5 md:h-5 text-white/80" />
+          <div className="p-1.5 md:p-2 bg-red-900/20 rounded-lg">
+            <AlertCircle className="w-4 h-4 md:w-5 md:h-5 text-red-400/70" />
           </div>
-          <span className="text-xs md:text-sm font-light text-white tracking-wide">
+          <span className="text-xs md:text-sm font-light text-red-300/80 tracking-wide">
             {compliance.violations.length} Policy Violation{compliance.violations.length !== 1 ? 's' : ''}
           </span>
         </div>
         {showDetails ? (
-          <ChevronUp className="w-4 h-4 text-white/60" />
+          <ChevronUp className="w-4 h-4 text-red-400/60" />
         ) : (
-          <ChevronDown className="w-4 h-4 text-white/60" />
+          <ChevronDown className="w-4 h-4 text-red-400/60" />
         )}
       </button>
 
       {showDetails && (
-        <div className="border-t border-white/10 p-4 md:p-5 space-y-4 bg-white/5">
+        <div className="border-t border-red-900/30 p-4 md:p-5 space-y-4 bg-red-950/10">
           <div>
-            <h4 className="text-xs font-light text-white/50 mb-3 uppercase tracking-wider">Violations</h4>
+            <h4 className="text-xs font-light text-red-300/50 mb-3 uppercase tracking-wider">Violations</h4>
             <ul className="space-y-2 max-h-40 overflow-y-auto">
               {compliance.violations.slice(0, 5).map((violation: string, index: number) => (
-                <li key={index} className="text-xs text-white/70 flex items-start gap-2 font-light">
-                  <span className="text-white/40 mt-0.5">•</span>
+                <li key={index} className="text-xs text-red-200/70 flex items-start gap-2 font-light">
+                  <span className="text-red-400/40 mt-0.5">•</span>
                   <span>{violation}</span>
                 </li>
               ))}
@@ -374,15 +374,15 @@ const PolicyComplianceBadge = ({ compliance }: any) => {
           </div>
 
           {compliance.warnings?.length > 0 && (
-            <div className="pt-3 border-t border-white/10">
-              <h4 className="text-xs font-light text-white/50 mb-3 uppercase tracking-wider flex items-center gap-2">
-                <AlertTriangle className="w-3 h-3" />
+            <div className="pt-3 border-t border-amber-900/30">
+              <h4 className="text-xs font-light text-amber-300/50 mb-3 uppercase tracking-wider flex items-center gap-2">
+                <AlertTriangle className="w-3 h-3 text-amber-400/60" />
                 Warnings
               </h4>
               <ul className="space-y-2">
                 {compliance.warnings.slice(0, 3).map((warning: string, index: number) => (
-                  <li key={index} className="text-xs text-white/70 flex items-start gap-2 font-light">
-                    <span className="text-white/40 mt-0.5">⚠</span>
+                  <li key={index} className="text-xs text-amber-200/70 flex items-start gap-2 font-light">
+                    <span className="text-amber-400/50 mt-0.5">⚠</span>
                     <span>{warning}</span>
                   </li>
                 ))}
@@ -518,6 +518,7 @@ const ChatDashboard = () => {
     const component = msg.ui_state?.component;
     const data = msg.data;
     const isDisabled = msg.index !== activeComponentIndex;
+    const policyCompliance = data?.policy_compliance || data?.leave_data?.policy_compliance;
 
     if (component === 'GREETING') {
       return <GreetingCard onQuickAction={handleQuickAction} disabled={isDisabled} />;
@@ -541,17 +542,19 @@ const ChatDashboard = () => {
     if (component === 'CONFIRMATION_CARD') {
       const leaveData = data?.leave_data || data;
       return (
-        <ConfirmationCard
-          leaveData={leaveData}
-          onConfirm={() => handleConfirmLeave(leaveData)}
-          onEdit={() => handleSend('edit')}
-          disabled={isDisabled}
-          isSubmitting={isSubmitting}
-        />
+        <>
+          {policyCompliance && <PolicyComplianceBadge compliance={policyCompliance} />}
+          <ConfirmationCard
+            leaveData={leaveData}
+            onConfirm={() => handleConfirmLeave(leaveData)}
+            onEdit={() => handleSend('edit')}
+            disabled={isDisabled}
+            isSubmitting={isSubmitting}
+          />
+        </>
       );
     }
 
-    const policyCompliance = data?.policy_compliance || data?.leave_data?.policy_compliance;
     if (policyCompliance) {
       return <PolicyComplianceBadge compliance={policyCompliance} />;
     }
