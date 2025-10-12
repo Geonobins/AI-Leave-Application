@@ -1,38 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Upload, FileText, Trash2, Eye, AlertCircle, CheckCircle, XCircle, Search, Shield, TrendingUp } from 'lucide-react';
-
-// Mock API types
-interface CompanyPolicy {
-  id: number;
-  filename: string;
-  policy_type: string;
-  upload_date: string;
-  embedding_status: string;
-  is_active: boolean;
-}
-
-interface PolicyStats {
-  total_policies: number;
-  active_policies: number;
-  policy_types: string[];
-  total_chunks: number;
-}
-
-interface PolicyQueryResult {
-  section_title?: string;
-  content: string;
-  similarity: number;
-  policy_name: string;
-}
-
-interface PolicyDetails {
-  id: number;
-  filename: string;
-  policy_type: string;
-  upload_date: string;
-  chunks_count: number;
-  preview?: string;
-}
+import { hrApi, type CompanyPolicy, type PolicyStats, type PolicyQueryResult, type PolicyDetails } from '../../api/endpoints/hr.api';
 
 const PolicyManagementPage: React.FC = () => {
   const [policies, setPolicies] = useState<CompanyPolicy[]>([]);
@@ -47,35 +15,31 @@ const PolicyManagementPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Simulate loading
-    setTimeout(() => {
-      setPolicies([
-        {
-          id: 1,
-          filename: 'Company_Leave_Policy.pdf',
-          policy_type: 'LEAVE',
-          upload_date: '2025-01-15T10:30:00Z',
-          embedding_status: 'COMPLETED',
-          is_active: true
-        },
-        {
-          id: 2,
-          filename: 'Code_of_Conduct_2025.docx',
-          policy_type: 'CODE_OF_CONDUCT',
-          upload_date: '2025-02-01T14:20:00Z',
-          embedding_status: 'COMPLETED',
-          is_active: true
-        }
-      ]);
-      setStats({
-        total_policies: 2,
-        active_policies: 2,
-        policy_types: ['LEAVE', 'CODE_OF_CONDUCT'],
-        total_chunks: 156
-      });
-      setLoading(false);
-    }, 1000);
+    fetchPolicies();
+    fetchStats();
   }, []);
+
+  const fetchPolicies = async () => {
+    try {
+      const data = await hrApi.getAllPolicies();
+      setPolicies(data);
+      setError(null);
+    } catch (error) {
+      console.error('Failed to fetch policies:', error);
+      setError('Failed to load policies');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchStats = async () => {
+    try {
+      const data = await hrApi.getPolicyStats();
+      setStats(data);
+    } catch (error) {
+      console.error('Failed to fetch stats:', error);
+    }
+  };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -96,39 +60,55 @@ const PolicyManagementPage: React.FC = () => {
 
   const handleUpload = async () => {
     if (!selectedFile) return;
+
     setUploading(true);
-    setTimeout(() => {
-      setUploading(false);
+    try {
+      const result = await hrApi.uploadPolicy(selectedFile, policyType);
+      alert(`Policy uploaded successfully! ${result.chunks_created} chunks created.`);
       setSelectedFile(null);
+      fetchPolicies();
+      fetchStats();
       setError(null);
-    }, 2000);
+    } catch (error: any) {
+      setError(`Upload failed: ${error.response?.data?.detail || error.message}`);
+    } finally {
+      setUploading(false);
+    }
   };
 
   const handleDelete = async (policyId: number) => {
-    setPolicies(policies.filter(p => p.id !== policyId));
+    if (!confirm('Are you sure you want to delete this policy?')) return;
+
+    try {
+      await hrApi.deletePolicy(policyId);
+      alert('Policy deleted successfully');
+      fetchPolicies();
+      fetchStats();
+    } catch (error) {
+      setError('Failed to delete policy');
+    }
   };
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
-    setSearchResults([
-      {
-        section_title: 'Annual Leave Policy',
-        content: 'Full-time employees are entitled to 21 days of annual leave per year. Employees with 5+ years of service receive 25 days per year.',
-        similarity: 0.92,
-        policy_name: 'Company_Leave_Policy.pdf'
-      }
-    ]);
+
+    try {
+      const data = await hrApi.queryPolicies(searchQuery, 5);
+      setSearchResults(data.results || []);
+    } catch (error) {
+      console.error('Search failed:', error);
+      setError('Search failed');
+    }
   };
 
   const viewPolicyDetails = async (policyId: number) => {
-    setSelectedPolicy({
-      id: policyId,
-      filename: 'Company_Leave_Policy.pdf',
-      policy_type: 'LEAVE',
-      upload_date: '2025-01-15T10:30:00Z',
-      chunks_count: 78,
-      preview: 'This document outlines the company leave policy including annual leave, sick leave, casual leave...'
-    });
+    try {
+      const data = await hrApi.getPolicyDetails(policyId);
+      setSelectedPolicy(data);
+    } catch (error) {
+      console.error('Failed to fetch policy details:', error);
+      setError('Failed to load policy details');
+    }
   };
 
   const getStatusBadge = (status: string) => {
